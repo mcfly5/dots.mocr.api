@@ -2,9 +2,12 @@ import os
 import sys
 import json
 import re
+from pathlib import Path
 
 from PIL import Image
 from dots_mocr.utils.image_utils import PILimage_to_base64
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 
 
 def has_latex_markdown(text: str) -> bool:
