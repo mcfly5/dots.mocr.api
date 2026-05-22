@@ -2,9 +2,12 @@ import os
 import sys
 import json
 import re
+from pathlib import Path
 
 from PIL import Image
 from dots_mocr.utils.image_utils import PILimage_to_base64
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 
 
 def has_latex_markdown(text: str) -> bool:
@@ -191,8 +194,11 @@ def layoutjson2md(
                     tmp_path = f.name
                 try:
                     image_crop.save(tmp_path)
+                    script_path = Path(describe_script)
+                    if not script_path.is_absolute():
+                        script_path = _SCRIPTS_DIR / script_path
                     proc = subprocess.run(
-                        [sys.executable, describe_script, tmp_path],
+                        [sys.executable, str(script_path), tmp_path],
                         capture_output=True, text=True, timeout=30,
                     )
                     description = proc.stdout.strip() or "[Image]"

@@ -196,3 +196,6 @@ train_multi_node_7b_vlm.sh
 playground/
 outputs
 dummy.*
+
+weights/
+
