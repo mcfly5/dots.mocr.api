@@ -264,6 +264,42 @@ Fetch the result once `task_status` is `success`. Returns the same response shap
 | `to_formats` | list | `["md","json"]` | Output formats: `"md"`, `"json"`, `"text"` |
 | `page_range` | `[start, end]` | `null` | 0-indexed, inclusive. PDF only. E.g. `[0, 4]` for first 5 pages |
 | `prompt_mode` | string | `null` | Override the prompt used. See table below |
+| `image_mode` | string | `"base64"` | How `Picture` cells are rendered in Markdown output. See **Image Handling** below |
+| `describe_script` | string | `null` | Path to a Python script used when `image_mode` is `"describe"` |
+
+### Image Handling
+
+The `image_mode` option controls how detected `Picture` layout cells are embedded in the `md_content` output.
+
+| `image_mode` | Markdown output | Notes |
+|---|---|---|
+| `base64` _(default)_ | `![](data:image/png;base64,...)` | Crops the region and inlines it as a data URI. Self-contained but increases response size. |
+| `file_ref` | `![](picture_0.png)` | Emits a filename placeholder — no image data is included. Useful when you handle images separately. |
+| `describe` | `> [Image: <description>]` | Calls `describe_script` with the cropped image path and embeds its stdout as text. |
+
+**`describe` mode setup:**
+
+Provide `describe_script` as a path to a Python script. The server calls it as:
+```
+python <describe_script> <tmp_image_path>
+```
+The script should print a single-line description to stdout. A stub is provided at `scripts/describe_image.py` — replace its body with real logic (e.g. a VLM call).
+
+**Example — file_ref mode:**
+```bash
+curl -s -X POST http://localhost:8003/v1/convert/file \
+  -F "files=@document.pdf" \
+  -F 'options_json={"image_mode":"file_ref","to_formats":["md"]}'
+```
+
+**Example — describe mode:**
+```bash
+curl -s -X POST http://localhost:8003/v1/convert/file \
+  -F "files=@document.pdf" \
+  -F 'options_json={"image_mode":"describe","describe_script":"scripts/describe_image.py","to_formats":["md"]}'
+```
+
+---
 
 ### Prompt Modes
 

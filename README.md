@@ -699,6 +699,18 @@ python3 dots_mocr/parser.py demo/demo_image1.jpg --prompt prompt_ocr
 
 > Notice: transformers is slower than vllm, if you want to use demo/* with transformers，just add `use_hf=True` in `DotsMOCRParser(..,use_hf=True)`
 
+### Image Handling in Markdown Output
+
+When using the API or calling the parser programmatically, you can control how detected `Picture` cells appear in the Markdown output via the `image_mode` option:
+
+| Mode | Output | When to use |
+|---|---|---|
+| `base64` _(default)_ | `![](data:image/png;base64,...)` | Self-contained documents; images embedded inline |
+| `file_ref` | `![](picture_0.png)` | Lightweight output; handle image files separately |
+| `describe` | `> [Image: <text description>]` | LLM pipelines that need text-only output |
+
+The `describe` mode calls an external script (`scripts/describe_image.py`) with the cropped image path and uses its stdout as the description — replace the stub with your own VLM or captioning logic. See [README-API.md](README-API.md) for full API details.
+
 <details>
 <summary><b>Output Results</b></summary>
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Optional, Union
 
+IMAGE_MODES = {"base64", "file_ref", "describe"}
+
 from pydantic import BaseModel, Field, field_validator
 
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf"}
@@ -52,6 +54,8 @@ class ConvertDocumentsOptions(BaseModel):
     to_formats: list[str] = ["md", "json"]
     page_range: Optional[list[int]] = None
     prompt_mode: Optional[str] = None
+    image_mode: Literal["base64", "file_ref", "describe"] = "base64"
+    describe_script: Optional[str] = None
 
     @field_validator("prompt_mode")
     @classmethod
