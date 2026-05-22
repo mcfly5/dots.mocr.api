@@ -155,17 +155,19 @@ class DotsMOCRParser:
 
     # def post_process_results(self, response, prompt_mode, save_dir, save_name, origin_image, image, min_pixels, max_pixels)
     def _parse_single_image(
-        self, 
-        origin_image, 
-        prompt_mode, 
-        save_dir, 
-        save_name, 
-        source="image", 
-        page_idx=0, 
+        self,
+        origin_image,
+        prompt_mode,
+        save_dir,
+        save_name,
+        source="image",
+        page_idx=0,
         bbox=None,
         fitz_preprocess=False,
         custom_prompt=None,
         temperature=None,
+        image_mode="base64",
+        describe_script=None,
         ):
         min_pixels, max_pixels = self.min_pixels, self.max_pixels
         if prompt_mode == "prompt_grounding_ocr":
@@ -242,8 +244,8 @@ class DotsMOCRParser:
                     'layout_image_path': image_layout_path,
                 })
                 if prompt_mode != "prompt_layout_only_en":  # no text md when detection only
-                    md_content = layoutjson2md(origin_image, cells, text_key='text')
-                    md_content_no_hf = layoutjson2md(origin_image, cells, text_key='text', no_page_hf=True) # used for clean output or metric of omnidocbench、olmbench 
+                    md_content = layoutjson2md(origin_image, cells, text_key='text', image_mode=image_mode, describe_script=describe_script)
+                    md_content_no_hf = layoutjson2md(origin_image, cells, text_key='text', no_page_hf=True, image_mode=image_mode, describe_script=describe_script)
                     md_file_path = os.path.join(save_dir, f"{save_name}.md")
                     with open(md_file_path, "w", encoding="utf-8") as md_file:
                         md_file.write(md_content)
@@ -336,13 +338,13 @@ class DotsMOCRParser:
 
         return result
     
-    def parse_image(self, input_path, filename, prompt_mode, save_dir, bbox=None, fitz_preprocess=False, custom_prompt=None, temperature=None):
+    def parse_image(self, input_path, filename, prompt_mode, save_dir, bbox=None, fitz_preprocess=False, custom_prompt=None, temperature=None, image_mode="base64", describe_script=None):
         origin_image = fetch_image(input_path)
-        result = self._parse_single_image(origin_image, prompt_mode, save_dir, filename, source="image", bbox=bbox, fitz_preprocess=fitz_preprocess, custom_prompt=custom_prompt, temperature=temperature)
+        result = self._parse_single_image(origin_image, prompt_mode, save_dir, filename, source="image", bbox=bbox, fitz_preprocess=fitz_preprocess, custom_prompt=custom_prompt, temperature=temperature, image_mode=image_mode, describe_script=describe_script)
         result['file_path'] = input_path
         return [result]
         
-    def parse_pdf(self, input_path, filename, prompt_mode, save_dir):
+    def parse_pdf(self, input_path, filename, prompt_mode, save_dir, image_mode="base64", describe_script=None):
         print(f"loading pdf: {input_path}")
         images_origin = load_images_from_pdf(input_path, dpi=self.dpi)
         total_pages = len(images_origin)
@@ -352,8 +354,10 @@ class DotsMOCRParser:
                 "prompt_mode": prompt_mode,
                 "save_dir": save_dir,
                 "save_name": filename,
-                "source":"pdf",
+                "source": "pdf",
                 "page_idx": i,
+                "image_mode": image_mode,
+                "describe_script": describe_script,
             } for i, image in enumerate(images_origin)
         ]
 

@@ -142,34 +142,68 @@ def clean_text(text: str) -> str:
     return text
 
 
-def layoutjson2md(image: Image.Image, cells: list, text_key: str = 'text', no_page_hf: bool = False) -> str:
+def layoutjson2md(
+    image: Image.Image,
+    cells: list,
+    text_key: str = 'text',
+    no_page_hf: bool = False,
+    image_mode: str = "base64",
+    describe_script: str | None = None,
+) -> str:
     """
     Converts a layout JSON format to Markdown.
-    
-    In the layout JSON, formulas are LaTeX, tables are HTML, and text is Markdown.
-    
+
     Args:
         image: A PIL Image object.
         cells: A list of dictionaries, each representing a layout cell.
         text_key: The key for the text field in the cell dictionary.
-        no_page_header_footer: If True, skips page headers and footers.
-        
+        no_page_hf: If True, skips page headers and footers.
+        image_mode: How to render Picture cells — "base64" (inline data URI),
+            "file_ref" (plain filename tag, no file written), or "describe"
+            (call describe_script and embed its stdout as text).
+        describe_script: Path to a Python script used when image_mode="describe".
+            Called as: python <describe_script> <image_path>; stdout is the description.
+
     Returns:
         str: The text in Markdown format.
     """
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
     text_items = []
+    picture_idx = 0
 
     for i, cell in enumerate(cells):
         x1, y1, x2, y2 = [int(coord) for coord in cell['bbox']]
         text = cell.get(text_key, "")
-        
+
         if no_page_hf and cell['category'] in ['Page-header', 'Page-footer']:
             continue
-        
+
         if cell['category'] == 'Picture':
-            image_crop = image.crop((x1, y1, x2, y2))
-            image_base64 = PILimage_to_base64(image_crop)
-            text_items.append(f"![]({image_base64})")
+            if image_mode == "file_ref":
+                text_items.append(f"![](picture_{picture_idx}.png)")
+            elif image_mode == "describe" and describe_script:
+                image_crop = image.crop((x1, y1, x2, y2))
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                    tmp_path = f.name
+                try:
+                    image_crop.save(tmp_path)
+                    proc = subprocess.run(
+                        [sys.executable, describe_script, tmp_path],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    description = proc.stdout.strip() or "[Image]"
+                finally:
+                    os.unlink(tmp_path)
+                text_items.append(f"> [Image: {description}]")
+            else:
+                image_crop = image.crop((x1, y1, x2, y2))
+                image_base64 = PILimage_to_base64(image_crop)
+                text_items.append(f"![]({image_base64})")
+            picture_idx += 1
         elif cell['category'] == 'Formula':
             text_items.append(get_formula_in_markdown(text))
         else:            

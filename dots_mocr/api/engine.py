@@ -83,11 +83,13 @@ def _parse_pdf_with_page_range(
     prompt_mode: str,
     save_dir: str,
     page_range: Optional[list[int]],
+    image_mode: str = "base64",
+    describe_script: Optional[str] = None,
 ) -> list[dict]:
     from dots_mocr.utils.doc_utils import load_images_from_pdf
 
     if page_range is None:
-        return parser.parse_pdf(file_path, stem, prompt_mode, save_dir)
+        return parser.parse_pdf(file_path, stem, prompt_mode, save_dir, image_mode=image_mode, describe_script=describe_script)
 
     start_page, end_page = page_range[0], page_range[1]
     images = load_images_from_pdf(
@@ -104,6 +106,8 @@ def _parse_pdf_with_page_range(
             "save_name": stem,
             "source": "pdf",
             "page_idx": start_page + i,
+            "image_mode": image_mode,
+            "describe_script": describe_script,
         }
         for i, img in enumerate(images)
     ]
@@ -126,6 +130,8 @@ def _convert_file_sync(
     prompt_mode: str,
     page_range: Optional[list[int]],
     to_formats: list[str],
+    image_mode: str = "base64",
+    describe_script: Optional[str] = None,
 ) -> ConvertDocumentResponse:
     start = time.monotonic()
     stem = Path(filename).stem
@@ -136,10 +142,11 @@ def _convert_file_sync(
     try:
         if suffix == ".pdf":
             results = _parse_pdf_with_page_range(
-                parser, file_path, stem, prompt_mode, tmp_out, page_range
+                parser, file_path, stem, prompt_mode, tmp_out, page_range,
+                image_mode=image_mode, describe_script=describe_script,
             )
         else:
-            results = parser.parse_image(file_path, stem, prompt_mode, tmp_out)
+            results = parser.parse_image(file_path, stem, prompt_mode, tmp_out, image_mode=image_mode, describe_script=describe_script)
 
         if not results:
             errors.append(ErrorItem(message="Parser returned no results"))
@@ -221,6 +228,8 @@ async def convert_source(
                 prompt_mode,
                 request.options.page_range,
                 request.options.to_formats,
+                request.options.image_mode,
+                request.options.describe_script,
             )
             results.append(result)
         finally:
