@@ -194,11 +194,8 @@ def layoutjson2md(
                     tmp_path = f.name
                 try:
                     image_crop.save(tmp_path)
-                    script_path = Path(describe_script)
-                    if not script_path.is_absolute():
-                        script_path = _SCRIPTS_DIR / script_path
                     proc = subprocess.run(
-                        [sys.executable, str(script_path), tmp_path],
+                        [sys.executable, describe_script, tmp_path],
                         capture_output=True, text=True, timeout=30,
                     )
                     description = proc.stdout.strip() or "[Image]"
