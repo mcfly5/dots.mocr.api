@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import httpx
+
+logger = logging.getLogger("uvicorn.error")
 
 from dots_mocr.api.datamodel.requests import (
     ConvertDocumentsOptions,
@@ -153,6 +156,13 @@ def _convert_file_sync(
     suffix = Path(filename).suffix.lower()
     tmp_out = tempfile.mkdtemp(prefix="mocr_out_")
     errors: list[ErrorItem] = []
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else -1
+    logger.info(
+        "convert start: filename=%s suffix=%s size=%dB prompt_mode=%s "
+        "page_range=%s to_formats=%s image_mode=%s tmp_out=%s",
+        filename, suffix, file_size, prompt_mode, page_range, to_formats,
+        image_mode, tmp_out,
+    )
 
     try:
         if suffix == ".pdf":
@@ -164,12 +174,18 @@ def _convert_file_sync(
             results = parser.parse_image(file_path, stem, prompt_mode, tmp_out, image_mode=image_mode, describe_script=describe_script)
 
         if not results:
-            errors.append(ErrorItem(message="Parser returned no results"))
+            elapsed = time.monotonic() - start
+            logger.warning(
+                "convert failure: filename=%s no results (0 renderable pages) "
+                "in %.2fs",
+                filename, elapsed,
+            )
+            errors.append(ErrorItem(message="Parser returned no results (0 renderable pages)"))
             return ConvertDocumentResponse(
                 document=ExportDocumentResponse(filename=filename),
                 status="failure",
                 errors=errors,
-                processing_time=time.monotonic() - start,
+                processing_time=elapsed,
             )
 
         md_content, json_content = _assemble_outputs(results, to_formats)
@@ -179,6 +195,15 @@ def _convert_file_sync(
             else None
         )
 
+        elapsed = time.monotonic() - start
+        logger.info(
+            "convert success: filename=%s pages=%d md_chars=%s json_pages=%s "
+            "in %.2fs",
+            filename, len(results),
+            len(md_content) if md_content else 0,
+            len(json_content) if json_content else 0,
+            elapsed,
+        )
         return ConvertDocumentResponse(
             document=ExportDocumentResponse(
                 filename=filename,
@@ -188,15 +213,20 @@ def _convert_file_sync(
             ),
             status="success",
             errors=[],
-            processing_time=time.monotonic() - start,
+            processing_time=elapsed,
         )
     except Exception as exc:
+        elapsed = time.monotonic() - start
+        logger.exception(
+            "convert error: filename=%s failed after %.2fs: %s",
+            filename, elapsed, exc,
+        )
         errors.append(ErrorItem(message=str(exc)))
         return ConvertDocumentResponse(
             document=ExportDocumentResponse(filename=filename),
             status="failure",
             errors=errors,
-            processing_time=time.monotonic() - start,
+            processing_time=elapsed,
         )
     finally:
         shutil.rmtree(tmp_out, ignore_errors=True)
@@ -209,6 +239,10 @@ async def _materialise_source(source: FileSourceRequest | HttpSourceRequest) -> 
         fd, path = tempfile.mkstemp(suffix=suffix)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+        logger.debug(
+            "materialised upload: filename=%s size=%dB -> %s",
+            source.filename, len(data), path,
+        )
         return path, source.filename
 
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
@@ -220,6 +254,10 @@ async def _materialise_source(source: FileSourceRequest | HttpSourceRequest) -> 
     fd, path = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "wb") as f:
         f.write(resp.content)
+    logger.debug(
+        "materialised url: %s -> filename=%s size=%dB -> %s",
+        source.url, filename, len(resp.content), path,
+    )
     return path, filename
 
 
@@ -235,6 +273,12 @@ async def convert_source(
     for source in request.sources:
         file_path, filename = await _materialise_source(source)
         try:
+            if semaphore.locked():
+                logger.info(
+                    "convert queued: filename=%s waiting for a free slot "
+                    "(max_concurrent=%d)",
+                    filename, _MAX_CONCURRENT,
+                )
             async with semaphore:
                 result = await loop.run_in_executor(
                     None,

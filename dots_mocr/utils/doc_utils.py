@@ -1,9 +1,12 @@
 import fitz
+import logging
 import threading
 import numpy as np
 import enum
 from pydantic import BaseModel, Field
 from PIL import Image
+
+logger = logging.getLogger("uvicorn.error")
 
 
 # PyMuPDF / MuPDF is not thread-safe for concurrent document open/render.
@@ -104,15 +107,21 @@ def fitz_doc_to_image(doc, target_dpi=200, origin_dpi=None) -> dict:
 
 def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -> list:
     images = []
+    skipped_unsafe = 0
+    skipped_empty = 0
     with FITZ_LOCK, fitz.open(pdf_file) as doc:
         pdf_page_num = doc.page_count
+        logger.debug(
+            "load_images_from_pdf: file=%s page_count=%d dpi=%d range=[%s,%s]",
+            pdf_file, pdf_page_num, dpi, start_page_id, end_page_id,
+        )
         end_page_id = (
             end_page_id
             if end_page_id is not None and end_page_id >= 0
             else pdf_page_num - 1
         )
         if end_page_id > pdf_page_num - 1:
-            print('end_page_id is out of range, use images length')
+            logger.debug("end_page_id is out of range, use images length")
             end_page_id = pdf_page_num - 1
 
         for index in range(0, doc.page_count):
@@ -120,11 +129,21 @@ def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -
                 page = doc[index]
                 is_safe, reason = is_page_safe_to_render(page)
                 if not is_safe:
-                    print(f"pdf page {index} is not safe to render, skip")
-                    return []
+                    # Skip only this page rather than discarding the whole document.
+                    logger.warning(
+                        "pdf page %d of %s is not safe to render, skip: %s",
+                        index, pdf_file, reason,
+                    )
+                    skipped_unsafe += 1
+                    continue
                 img = fitz_doc_to_image(page, target_dpi=dpi)
                 if img is None:
-                    print(f"pdf page {index} is empty, skip")
+                    logger.warning("pdf page %d of %s is empty, skip", index, pdf_file)
+                    skipped_empty += 1
                     continue
                 images.append(img)
+    logger.info(
+        "load_images_from_pdf: file=%s rendered=%d skipped_unsafe=%d skipped_empty=%d",
+        pdf_file, len(images), skipped_unsafe, skipped_empty,
+    )
     return images

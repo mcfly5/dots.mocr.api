@@ -1,9 +1,13 @@
 import os
 import json
+import logging
+import time
 from tqdm import tqdm
 from multiprocessing.pool import ThreadPool, Pool
 import argparse
 from PIL import Image
+
+logger = logging.getLogger("uvicorn.error")
 
 from dots_mocr.model.inference import inference_with_vllm
 from dots_mocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
@@ -345,11 +349,11 @@ class DotsMOCRParser:
         return [result]
         
     def parse_pdf(self, input_path, filename, prompt_mode, save_dir, image_mode="base64", describe_script=None):
-        print(f"loading pdf: {input_path}")
+        logger.info("loading pdf: %s (prompt_mode=%s)", input_path, prompt_mode)
         images_origin = load_images_from_pdf(input_path, dpi=self.dpi)
         total_pages = len(images_origin)
         if total_pages == 0:
-            print(f"No renderable pages found in {input_path}")
+            logger.warning("No renderable pages found in %s", input_path)
             return []
         tasks = [
             {
@@ -371,14 +375,22 @@ class DotsMOCRParser:
             num_thread =  1
         else:
             num_thread = min(total_pages, self.num_thread)
-        print(f"Parsing PDF with {total_pages} pages using {num_thread} threads...")
+        logger.info(
+            "Parsing PDF %s with %d pages using %d threads...",
+            input_path, total_pages, num_thread,
+        )
 
+        start = time.monotonic()
         results = []
         with ThreadPool(num_thread) as pool:
             with tqdm(total=total_pages, desc="Processing PDF pages") as pbar:
                 for result in pool.imap_unordered(_execute_task, tasks):
                     results.append(result)
                     pbar.update(1)
+        logger.info(
+            "Parsed PDF %s: %d/%d pages in %.2fs",
+            input_path, len(results), total_pages, time.monotonic() - start,
+        )
 
         results.sort(key=lambda x: x["page_no"])
         for i in range(len(results)):
