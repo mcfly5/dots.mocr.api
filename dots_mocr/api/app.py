@@ -254,11 +254,27 @@ async def get_result(
 async def _uploads_to_sources(files: list[UploadFile]) -> list[FileSourceRequest]:
     sources = []
     for upload in files:
+        filename = upload.filename or "upload.pdf"
+        # Defensive: ensure we read from the start of the spooled part.
+        try:
+            await upload.seek(0)
+        except (OSError, AttributeError):
+            pass
         data = await upload.read()
+        logger.info("received upload: filename=%s size=%dB", filename, len(data))
+        if not data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Uploaded file '{filename}' is empty (0 bytes). The file "
+                    "content did not reach the server — check the client upload "
+                    "and any proxy/gateway in front of the API."
+                ),
+            )
         sources.append(
             FileSourceRequest(
                 base64_string=base64.b64encode(data).decode(),
-                filename=upload.filename or "upload.pdf",
+                filename=filename,
             )
         )
     return sources
