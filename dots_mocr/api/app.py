@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -19,15 +21,20 @@ from fastapi import (
 
 from dots_mocr.api.auth import get_api_key_dependency
 from dots_mocr.api.datamodel.requests import (
+    IMAGE_MODES,
     ConvertDocumentsOptions,
     ConvertDocumentsRequest,
     FileSourceRequest,
 )
 from dots_mocr.api.datamodel.responses import (
     ConvertDocumentResponse,
+    ErrorItem,
+    ExportDocumentResponse,
     TaskStatusResponse,
     VersionResponse,
 )
+logger = logging.getLogger("uvicorn.error")
+
 from dots_mocr.api.engine import convert_source
 from dots_mocr.api.task_manager import TaskManager, TaskStatus
 from dots_mocr.parser import DotsMOCRParser
@@ -45,6 +52,7 @@ async def lifespan(app: FastAPI):
         port=int(os.environ.get("VLLM_PORT", "8000")),
         model_name=os.environ.get("VLLM_MODEL_NAME", "model"),
         output_dir=os.environ.get("MOCR_OUTPUT_DIR", "/tmp/mocr_output"),
+        num_thread=int(os.environ.get("VLLM_NUM_THREAD", "64")),
     )
     _task_manager = TaskManager(
         max_age_seconds=int(os.environ.get("MOCR_TASK_TTL", "3600"))
@@ -121,18 +129,37 @@ async def convert_source_sync(
 
 @app.post(
     "/v1/convert/file",
-    response_model=list[ConvertDocumentResponse],
+    response_model=ConvertDocumentResponse,
     dependencies=[Depends(_require_auth)],
 )
 async def convert_file_sync(
     files: list[UploadFile] = File(...),
     options_json: str = Form(default="{}"),
+    image_mode: Optional[str] = Form(default=None),
+    to_formats: Optional[str] = Form(default=None),
     parser: DotsMOCRParser = Depends(_get_parser),
 ):
     options = ConvertDocumentsOptions.model_validate_json(options_json)
+    if image_mode is not None and image_mode in IMAGE_MODES:
+        options.image_mode = image_mode
+    if to_formats is not None:
+        try:
+            parsed = json.loads(to_formats)
+        except (ValueError, TypeError):
+            parsed = [f.strip() for f in to_formats.split(",") if f.strip()]
+        options.to_formats = parsed
+    logger.info("convert_file options: %s", options.model_dump())
     sources = await _uploads_to_sources(files)
     request = ConvertDocumentsRequest(sources=sources, options=options)
-    return await convert_source(parser, request)
+    results = await convert_source(parser, request)
+    if not results:
+        return ConvertDocumentResponse(
+            document=ExportDocumentResponse(filename="unknown"),
+            status="failure",
+            errors=[ErrorItem(message="No results")],
+            processing_time=0.0,
+        )
+    return results[0]
 
 
 # ── Async: JSON body sources ───────────────────────────────────────────────────

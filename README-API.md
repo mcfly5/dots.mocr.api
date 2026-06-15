@@ -68,6 +68,8 @@ All settings are via environment variables. None are required — defaults work 
 | `VLLM_PORT` | `8000` | vLLM server port |
 | `VLLM_PROTOCOL` | `http` | `http` or `https` |
 | `VLLM_MODEL_NAME` | `model` | Model name passed to vLLM |
+| `VLLM_NUM_THREAD` | `64` | Concurrent page inference calls sent to vLLM **per document** |
+| `MOCR_MAX_CONCURRENT` | `2` | Max documents converted concurrently; extra requests queue and wait |
 | `MOCR_API_KEY` | _(unset)_ | When set, enables API key auth on all `/v1` endpoints |
 | `MOCR_OUTPUT_DIR` | `/tmp/mocr_output` | Base directory for temporary output files |
 | `MOCR_TASK_TTL` | `3600` | Seconds to retain async task records in memory |
@@ -76,6 +78,30 @@ All settings are via environment variables. None are required — defaults work 
 ```bash
 MOCR_API_KEY=mysecret VLLM_HOST=gpu-server python serve.py --port 8003
 ```
+
+### Concurrency & GPU load
+
+OCR is GPU-bound: the actual inference runs on the vLLM server. Two settings cap
+how much work is in flight at once, so concurrent requests don't overwhelm the GPU
+(which otherwise shows up as vLLM timeouts, OOM, or—because PyMuPDF rasterization
+races under load—occasional `0 pages` failures):
+
+- **`MOCR_MAX_CONCURRENT`** limits how many documents are processed at the same time.
+  It's an async semaphore — requests beyond the limit **wait their turn** (they are
+  not rejected), then run when a slot frees.
+- **`VLLM_NUM_THREAD`** limits how many pages of a single document are sent to vLLM
+  concurrently.
+
+Effective concurrent inference ≈ `MOCR_MAX_CONCURRENT × VLLM_NUM_THREAD`. For a
+single GPU, start with `MOCR_MAX_CONCURRENT=1` (or `2`) and tune `VLLM_NUM_THREAD`
+to keep the GPU busy without triggering vLLM timeouts:
+
+```bash
+MOCR_MAX_CONCURRENT=1 VLLM_NUM_THREAD=32 python serve.py --port 8003
+```
+
+For large or bursty batches, prefer the asynchronous `/v1/convert/*/async`
+endpoints (fire-and-forget + polling) over holding a synchronous connection open.
 
 ---
 

@@ -30,6 +30,21 @@ if TYPE_CHECKING:
     from dots_mocr.parser import DotsMOCRParser
 
 
+# GPU-bound work: cap how many documents are converted concurrently. Each
+# document still fans out up to parser.num_thread page requests to vLLM, so
+# effective GPU concurrency ≈ MOCR_MAX_CONCURRENT * num_thread.
+_MAX_CONCURRENT = int(os.environ.get("MOCR_MAX_CONCURRENT", "2"))
+_semaphore: Optional["asyncio.Semaphore"] = None
+
+
+def _get_semaphore() -> "asyncio.Semaphore":
+    # Created lazily so it binds to the running event loop.
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _semaphore
+
+
 def resolve_prompt_mode(options: ConvertDocumentsOptions) -> str:
     if options.prompt_mode:
         return options.prompt_mode
@@ -214,23 +229,25 @@ async def convert_source(
 ) -> list[ConvertDocumentResponse]:
     loop = asyncio.get_event_loop()
     prompt_mode = resolve_prompt_mode(request.options)
+    semaphore = _get_semaphore()
     results: list[ConvertDocumentResponse] = []
 
     for source in request.sources:
         file_path, filename = await _materialise_source(source)
         try:
-            result = await loop.run_in_executor(
-                None,
-                _convert_file_sync,
-                parser,
-                file_path,
-                filename,
-                prompt_mode,
-                request.options.page_range,
-                request.options.to_formats,
-                request.options.image_mode,
-                request.options.describe_script,
-            )
+            async with semaphore:
+                result = await loop.run_in_executor(
+                    None,
+                    _convert_file_sync,
+                    parser,
+                    file_path,
+                    filename,
+                    prompt_mode,
+                    request.options.page_range,
+                    request.options.to_formats,
+                    request.options.image_mode,
+                    request.options.describe_script,
+                )
             results.append(result)
         finally:
             try:

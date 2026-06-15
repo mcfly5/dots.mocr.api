@@ -4,7 +4,7 @@ from PIL import Image
 from typing import Tuple
 import os
 from dots_mocr.utils.consts import IMAGE_FACTOR, MIN_PIXELS, MAX_PIXELS
-from dots_mocr.utils.doc_utils import fitz_doc_to_image
+from dots_mocr.utils.doc_utils import fitz_doc_to_image, FITZ_LOCK
 from io import BytesIO
 import fitz
 import requests
@@ -188,9 +188,11 @@ def get_image_by_fitz_doc(image, target_dpi=200):
         image.save(data_bytes, format='PNG')
 
     origin_dpi = image.info.get('dpi', None)
-    pdf_bytes = fitz.open(stream=data_bytes).convert_to_pdf()
-    doc = fitz.open('pdf', pdf_bytes)
-    page = doc[0]
-    image_fitz = fitz_doc_to_image(page, target_dpi=target_dpi, origin_dpi=origin_dpi)
+    # fitz/MuPDF is not thread-safe; serialize across concurrent requests.
+    with FITZ_LOCK:
+        pdf_bytes = fitz.open(stream=data_bytes).convert_to_pdf()
+        doc = fitz.open('pdf', pdf_bytes)
+        page = doc[0]
+        image_fitz = fitz_doc_to_image(page, target_dpi=target_dpi, origin_dpi=origin_dpi)
 
     return image_fitz

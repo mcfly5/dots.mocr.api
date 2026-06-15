@@ -1,8 +1,16 @@
 import fitz
+import threading
 import numpy as np
 import enum
 from pydantic import BaseModel, Field
 from PIL import Image
+
+
+# PyMuPDF / MuPDF is not thread-safe for concurrent document open/render.
+# The API server runs conversions in a multi-worker ThreadPoolExecutor, so
+# concurrent requests race inside fitz and intermittently yield a 0-page doc.
+# Serialize all fitz critical sections with this shared lock.
+FITZ_LOCK = threading.RLock()
 
 
 class SupportedPdfParseMethod(enum.Enum):
@@ -96,7 +104,7 @@ def fitz_doc_to_image(doc, target_dpi=200, origin_dpi=None) -> dict:
 
 def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -> list:
     images = []
-    with fitz.open(pdf_file) as doc:
+    with FITZ_LOCK, fitz.open(pdf_file) as doc:
         pdf_page_num = doc.page_count
         end_page_id = (
             end_page_id

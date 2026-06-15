@@ -348,6 +348,9 @@ class DotsMOCRParser:
         print(f"loading pdf: {input_path}")
         images_origin = load_images_from_pdf(input_path, dpi=self.dpi)
         total_pages = len(images_origin)
+        if total_pages == 0:
+            print(f"No renderable pages found in {input_path}")
+            return []
         tasks = [
             {
                 "origin_image": image,
