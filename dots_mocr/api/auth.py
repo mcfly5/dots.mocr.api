@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 
 from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader
@@ -14,7 +15,7 @@ def get_api_key_dependency():
     async def verify(api_key: str = Security(_API_KEY_HEADER)) -> None:
         if not expected_key:
             return
-        if api_key != expected_key:
+        if api_key is None or not secrets.compare_digest(api_key, expected_key):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing API key",

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import hashlib
 import json
 import logging
 import os
@@ -11,13 +13,16 @@ import tempfile
 import time
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
+from urllib.parse import urlparse
 
 import httpx
+from fastapi import HTTPException
 
 logger = logging.getLogger("uvicorn.error")
 
 from dots_mocr.api.datamodel.requests import (
+    VALID_EXTENSIONS,
     ConvertDocumentsOptions,
     ConvertDocumentsRequest,
     FileSourceRequest,
@@ -141,6 +146,26 @@ def _parse_pdf_with_page_range(
     return results
 
 
+_STEM_MAX_BYTES = 100
+
+
+def _safe_stem(stem: str) -> str:
+    """Build a filesystem-safe save_name for intermediate artifacts.
+
+    The stem is only used to name temp files (``<stem>_page_<n>.json`` etc.),
+    never the response filename, so truncating it is safe. Long non-ASCII names
+    blow past the 255-byte NAME_MAX once encoded to UTF-8, so cap by bytes and
+    append a digest to keep distinct sources distinct.
+    """
+    cleaned = re.sub(r"[/\\\x00]", "_", stem).strip() or "document"
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) <= _STEM_MAX_BYTES:
+        return cleaned
+    digest = hashlib.sha1(encoded).hexdigest()[:8]
+    truncated = encoded[: _STEM_MAX_BYTES - 9].decode("utf-8", errors="ignore").rstrip()
+    return f"{truncated}_{digest}"
+
+
 def _convert_file_sync(
     parser: "DotsMOCRParser",
     file_path: str,
@@ -152,7 +177,7 @@ def _convert_file_sync(
     describe_script: Optional[str] = None,
 ) -> ConvertDocumentResponse:
     start = time.monotonic()
-    stem = Path(filename).stem
+    stem = _safe_stem(Path(filename).stem)
     suffix = Path(filename).suffix.lower()
     tmp_out = tempfile.mkdtemp(prefix="mocr_out_")
     errors: list[ErrorItem] = []
@@ -232,10 +257,29 @@ def _convert_file_sync(
         shutil.rmtree(tmp_out, ignore_errors=True)
 
 
+_CONTENT_TYPE_SUFFIX = {
+    "application/pdf": ".pdf",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+}
+
+
 async def _materialise_source(source: FileSourceRequest | HttpSourceRequest) -> tuple[str, str]:
     if isinstance(source, FileSourceRequest):
         suffix = Path(source.filename).suffix.lower()
-        data = base64.b64decode(source.base64_string)
+        try:
+            data = base64.b64decode(source.base64_string)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid base64 content for '{source.filename}': {exc}",
+            )
+        if not data:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{source.filename}' is empty (0 bytes after base64 decode)",
+            )
         fd, path = tempfile.mkstemp(suffix=suffix)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -245,12 +289,24 @@ async def _materialise_source(source: FileSourceRequest | HttpSourceRequest) -> 
         )
         return path, source.filename
 
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        resp = await client.get(source.url, headers=source.headers)
-        resp.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            resp = await client.get(source.url, headers=source.headers)
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to download '{source.url}': {exc}",
+        )
 
-    filename = Path(str(source.url)).name or "document.pdf"
-    suffix = Path(filename).suffix.lower() or ".pdf"
+    # Take the filename from the URL path only — query strings would otherwise
+    # corrupt the suffix and route PDFs to the image parser.
+    filename = Path(urlparse(str(source.url)).path).name or "document.pdf"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in VALID_EXTENSIONS:
+        content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+        suffix = _CONTENT_TYPE_SUFFIX.get(content_type, ".pdf")
+        filename = f"{Path(filename).stem or 'document'}{suffix}"
     fd, path = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "wb") as f:
         f.write(resp.content)
@@ -264,6 +320,7 @@ async def _materialise_source(source: FileSourceRequest | HttpSourceRequest) -> 
 async def convert_source(
     parser: "DotsMOCRParser",
     request: ConvertDocumentsRequest,
+    on_start: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> list[ConvertDocumentResponse]:
     loop = asyncio.get_event_loop()
     prompt_mode = resolve_prompt_mode(request.options)
@@ -280,6 +337,11 @@ async def convert_source(
                     filename, _MAX_CONCURRENT,
                 )
             async with semaphore:
+                # Fires once actual work begins, i.e. after a concurrency slot
+                # is acquired — lets async tasks stay PENDING while queued.
+                if on_start is not None:
+                    await on_start()
+                    on_start = None
                 result = await loop.run_in_executor(
                     None,
                     _convert_file_sync,

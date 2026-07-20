@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Optional
 
 from fastapi import (
@@ -18,6 +19,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from pydantic import ValidationError
 
 from dots_mocr.api.auth import get_api_key_dependency
 from dots_mocr.api.datamodel.requests import (
@@ -28,8 +30,6 @@ from dots_mocr.api.datamodel.requests import (
 )
 from dots_mocr.api.datamodel.responses import (
     ConvertDocumentResponse,
-    ErrorItem,
-    ExportDocumentResponse,
     TaskStatusResponse,
     VersionResponse,
 )
@@ -67,7 +67,10 @@ async def lifespan(app: FastAPI):
 async def _gc_loop(tm: TaskManager) -> None:
     while True:
         await asyncio.sleep(600)
-        await tm.gc()
+        try:
+            await tm.gc()
+        except Exception:
+            logger.exception("task GC failed; will retry next cycle")
 
 
 app = FastAPI(
@@ -127,9 +130,46 @@ async def convert_source_sync(
 
 # ── Sync: multipart upload ─────────────────────────────────────────────────────
 
+def _parse_form_options(
+    options_json: str,
+    image_mode: Optional[str] = None,
+    to_formats: Optional[str] = None,
+) -> ConvertDocumentsOptions:
+    try:
+        options = ConvertDocumentsOptions.model_validate_json(options_json)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid options_json: {exc}",
+        )
+    if image_mode is not None:
+        if image_mode not in IMAGE_MODES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unknown image_mode '{image_mode}'. Valid: {sorted(IMAGE_MODES)}",
+            )
+        options.image_mode = image_mode
+    if to_formats is not None:
+        try:
+            parsed = json.loads(to_formats)
+        except (ValueError, TypeError):
+            parsed = [f.strip() for f in to_formats.split(",") if f.strip()]
+        # Rebuild so field validators run on the overridden value.
+        data = options.model_dump()
+        data["to_formats"] = parsed
+        try:
+            options = ConvertDocumentsOptions.model_validate(data)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid to_formats: {exc}",
+            )
+    return options
+
+
 @app.post(
     "/v1/convert/file",
-    response_model=ConvertDocumentResponse,
+    response_model=list[ConvertDocumentResponse],
     dependencies=[Depends(_require_auth)],
 )
 async def convert_file_sync(
@@ -139,27 +179,11 @@ async def convert_file_sync(
     to_formats: Optional[str] = Form(default=None),
     parser: DotsMOCRParser = Depends(_get_parser),
 ):
-    options = ConvertDocumentsOptions.model_validate_json(options_json)
-    if image_mode is not None and image_mode in IMAGE_MODES:
-        options.image_mode = image_mode
-    if to_formats is not None:
-        try:
-            parsed = json.loads(to_formats)
-        except (ValueError, TypeError):
-            parsed = [f.strip() for f in to_formats.split(",") if f.strip()]
-        options.to_formats = parsed
+    options = _parse_form_options(options_json, image_mode, to_formats)
     logger.info("convert_file options: %s", options.model_dump())
     sources = await _uploads_to_sources(files)
     request = ConvertDocumentsRequest(sources=sources, options=options)
-    results = await convert_source(parser, request)
-    if not results:
-        return ConvertDocumentResponse(
-            document=ExportDocumentResponse(filename="unknown"),
-            status="failure",
-            errors=[ErrorItem(message="No results")],
-            processing_time=0.0,
-        )
-    return results[0]
+    return await convert_source(parser, request)
 
 
 # ── Async: JSON body sources ───────────────────────────────────────────────────
@@ -188,13 +212,13 @@ async def convert_source_async(
     dependencies=[Depends(_require_auth)],
 )
 async def convert_file_async(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     options_json: str = Form(default="{}"),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
     parser: DotsMOCRParser = Depends(_get_parser),
     tm: TaskManager = Depends(_get_task_manager),
 ):
-    options = ConvertDocumentsOptions.model_validate_json(options_json)
+    options = _parse_form_options(options_json)
     # Read file bytes before returning — UploadFile is invalid after response is sent
     sources = await _uploads_to_sources(files)
     request = ConvertDocumentsRequest(sources=sources, options=options)
@@ -271,12 +295,18 @@ async def _uploads_to_sources(files: list[UploadFile]) -> list[FileSourceRequest
                     "and any proxy/gateway in front of the API."
                 ),
             )
-        sources.append(
-            FileSourceRequest(
-                base64_string=base64.b64encode(data).decode(),
-                filename=filename,
+        try:
+            sources.append(
+                FileSourceRequest(
+                    base64_string=base64.b64encode(data).decode(),
+                    filename=filename,
+                )
             )
-        )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid upload '{filename}': {exc}",
+            )
     return sources
 
 
@@ -286,9 +316,10 @@ async def _run_async_task(
     request: ConvertDocumentsRequest,
     task_id: str,
 ) -> None:
-    await tm.set_running(task_id)
     try:
-        result = await convert_source(parser, request)
+        result = await convert_source(
+            parser, request, on_start=partial(tm.set_running, task_id)
+        )
         await tm.set_success(task_id, result)
     except Exception as exc:
         await tm.set_failure(task_id, str(exc))
