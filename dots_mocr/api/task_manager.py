@@ -20,6 +20,7 @@ class TaskRecord:
     task_id: str
     status: TaskStatus = TaskStatus.PENDING
     created_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
     result: Optional[Any] = None
     error_message: Optional[str] = None
 
@@ -47,6 +48,7 @@ class TaskManager:
                 rec = self._tasks[task_id]
                 rec.status = TaskStatus.SUCCESS
                 rec.result = result
+                rec.finished_at = time.time()
 
     async def set_failure(self, task_id: str, error: str) -> None:
         async with self._lock:
@@ -54,12 +56,13 @@ class TaskManager:
                 rec = self._tasks[task_id]
                 rec.status = TaskStatus.FAILURE
                 rec.error_message = error
+                rec.finished_at = time.time()
 
     async def get(self, task_id: str) -> Optional[TaskRecord]:
         async with self._lock:
             return self._tasks.get(task_id)
 
-    async def position(self, task_id: str) -> int:
+    async def position(self, task_id: str) -> Optional[int]:
         async with self._lock:
             pending = [
                 t for t in self._tasks.values()
@@ -69,11 +72,17 @@ class TaskManager:
             for i, t in enumerate(pending):
                 if t.task_id == task_id:
                     return i
-            return 0
+            return None
 
     async def gc(self) -> None:
+        # Only terminal tasks age out; PENDING/RUNNING records must survive
+        # arbitrarily long queues so pollers never lose an in-flight job.
         cutoff = time.time() - self._max_age
         async with self._lock:
-            stale = [tid for tid, rec in self._tasks.items() if rec.created_at < cutoff]
+            stale = [
+                tid
+                for tid, rec in self._tasks.items()
+                if rec.finished_at is not None and rec.finished_at < cutoff
+            ]
             for tid in stale:
                 del self._tasks[tid]

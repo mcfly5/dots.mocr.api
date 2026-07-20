@@ -69,6 +69,7 @@ All settings are via environment variables. None are required — defaults work 
 | `VLLM_PROTOCOL` | `http` | `http` or `https` |
 | `VLLM_MODEL_NAME` | `model` | Model name passed to vLLM |
 | `VLLM_NUM_THREAD` | `64` | Concurrent page inference calls sent to vLLM **per document** |
+| `VLLM_TIMEOUT` | `300` | Per-page inference timeout in seconds. Raise it if large pages queue behind high `VLLM_NUM_THREAD` on a slow GPU |
 | `MOCR_MAX_CONCURRENT` | `2` | Max documents converted concurrently; extra requests queue and wait |
 | `MOCR_API_KEY` | _(unset)_ | When set, enables API key auth on all `/v1` endpoints |
 | `MOCR_OUTPUT_DIR` | `/tmp/mocr_output` | Base directory for temporary output files |
@@ -291,7 +292,7 @@ Fetch the result once `task_status` is `success`. Returns the same response shap
 | `page_range` | `[start, end]` | `null` | 0-indexed, inclusive. PDF only. E.g. `[0, 4]` for first 5 pages |
 | `prompt_mode` | string | `null` | Override the prompt used. See table below |
 | `image_mode` | string | `"base64"` | How `Picture` cells are rendered in Markdown output. See **Image Handling** below |
-| `describe_script` | string | `null` | Path to a Python script used when `image_mode` is `"describe"` |
+| `describe_script` | string | `null` | Python script used when `image_mode` is `"describe"`. Must live in the repository's `scripts/` directory |
 
 ### Image Handling
 
@@ -305,11 +306,16 @@ The `image_mode` option controls how detected `Picture` layout cells are embedde
 
 **`describe` mode setup:**
 
-Provide `describe_script` as a path to a Python script. The server calls it as:
+Provide `describe_script` as the name of a Python script inside the repository's
+`scripts/` directory (e.g. `describe_image.py` or `scripts/describe_image.py`;
+paths outside `scripts/` are rejected with `422`). The server calls it as:
 ```
 python <describe_script> <tmp_image_path>
 ```
-The script should print a single-line description to stdout. A stub is provided at `scripts/describe_image.py` — replace its body with real logic (e.g. a VLM call).
+The script should print a single-line description to stdout. If the script fails,
+times out (30s), or prints nothing, the cell degrades to `> [Image]` and the rest
+of the conversion proceeds. A stub is provided at `scripts/describe_image.py` —
+replace its body with real logic (e.g. a VLM call).
 
 **Example — file_ref mode:**
 ```bash
@@ -363,7 +369,7 @@ list[ConvertDocumentResponse]
        ├─ text_content:    plain text stripped of Markdown (null if not requested)
        ├─ html_content:    always null (not supported)
        └─ doctags_content: always null (not supported)
-     status:          "success" | "failure" | "partial_success"
+     status:          "success" | "failure"
      errors:          list of {message: string}
      processing_time: seconds (float)
 ```
@@ -465,8 +471,9 @@ print(results[0]["document"]["md_content"])
 
 | HTTP Status | Cause |
 |-------------|-------|
+| `400` | Empty upload (0 bytes) or invalid base64 content |
 | `401` | Missing or invalid `X-API-Key` (when auth is enabled) |
-| `422` | Validation error: unsupported file extension, bad `prompt_mode`, malformed `page_range` |
+| `422` | Validation error: unsupported file extension, bad `prompt_mode`, malformed `page_range`, invalid `options_json`/`to_formats`, disallowed `describe_script` |
 | `502` | HTTP source download failed |
 | `404` | Task ID not found (async endpoints) |
 | `202` | Task result requested but not yet complete |

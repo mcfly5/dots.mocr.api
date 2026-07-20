@@ -82,6 +82,14 @@ class ConvertDocumentsOptions(BaseModel):
             raise ValueError(f"Unknown to_formats values: {invalid}. Valid: {VALID_TO_FORMATS}")
         return v
 
+    @field_validator("describe_script")
+    @classmethod
+    def check_describe_script(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            from dots_mocr.utils.format_transformer import resolve_describe_script
+            resolve_describe_script(v)  # raises ValueError if disallowed/missing
+        return v
+
 
 class ConvertDocumentsRequest(BaseModel):
     sources: list[SourceRequestItem]

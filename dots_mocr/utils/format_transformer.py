@@ -1,13 +1,39 @@
 import os
 import sys
 import json
+import logging
 import re
 from pathlib import Path
 
 from PIL import Image
 from dots_mocr.utils.image_utils import PILimage_to_base64
 
+logger = logging.getLogger("uvicorn.error")
+
 _SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+
+
+def resolve_describe_script(describe_script: str) -> Path:
+    """Resolve a describe_script value to an allowed script path.
+
+    Only scripts inside the repository's `scripts/` directory may be executed;
+    describe_script comes from the API request, so anything else would let a
+    client run arbitrary Python files on the server.
+
+    Raises ValueError if the script is outside `scripts/` or does not exist.
+    """
+    candidate = Path(describe_script)
+    if not candidate.is_absolute():
+        # Accept "describe_image.py" as well as "scripts/describe_image.py".
+        candidate = _SCRIPTS_DIR / candidate.name
+    candidate = candidate.resolve()
+    if not candidate.is_relative_to(_SCRIPTS_DIR):
+        raise ValueError(
+            f"describe_script must be inside {_SCRIPTS_DIR}, got '{describe_script}'"
+        )
+    if not candidate.is_file():
+        raise ValueError(f"describe_script '{describe_script}' not found")
+    return candidate
 
 
 def has_latex_markdown(text: str) -> bool:
@@ -145,6 +171,46 @@ def clean_text(text: str) -> str:
     return text
 
 
+def _describe_image_crop(image_crop: Image.Image, describe_script: str) -> str:
+    """Run describe_script on a cropped image; return its description.
+
+    Never raises: any failure (disallowed script, crash, timeout) is logged
+    and returns "" so a single bad Picture cell cannot fail the whole page.
+    """
+    import subprocess
+    import tempfile
+
+    try:
+        script = resolve_describe_script(describe_script)
+    except ValueError as e:
+        logger.warning("describe_script rejected: %s", e)
+        return ""
+
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+        tmp_path = f.name
+    try:
+        image_crop.save(tmp_path)
+        proc = subprocess.run(
+            [sys.executable, str(script), tmp_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "describe_script %s exited %d: %s",
+                script, proc.returncode, proc.stderr.strip(),
+            )
+            return ""
+        return proc.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning("describe_script %s failed: %s", script, e)
+        return ""
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def layoutjson2md(
     image: Image.Image,
     cells: list,
@@ -164,17 +230,13 @@ def layoutjson2md(
         image_mode: How to render Picture cells — "base64" (inline data URI),
             "file_ref" (plain filename tag, no file written), or "describe"
             (call describe_script and embed its stdout as text).
-        describe_script: Path to a Python script used when image_mode="describe".
-            Called as: python <describe_script> <image_path>; stdout is the description.
+        describe_script: Script used when image_mode="describe". Must live in
+            the repository's scripts/ directory. Called as:
+            python <describe_script> <image_path>; stdout is the description.
 
     Returns:
         str: The text in Markdown format.
     """
-    import os
-    import subprocess
-    import sys
-    import tempfile
-
     text_items = []
     picture_idx = 0
 
@@ -189,19 +251,13 @@ def layoutjson2md(
             if image_mode == "file_ref":
                 text_items.append(f"![](picture_{picture_idx}.png)")
             elif image_mode == "describe" and describe_script:
-                image_crop = image.crop((x1, y1, x2, y2))
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                    tmp_path = f.name
-                try:
-                    image_crop.save(tmp_path)
-                    proc = subprocess.run(
-                        [sys.executable, describe_script, tmp_path],
-                        capture_output=True, text=True, timeout=30,
-                    )
-                    description = proc.stdout.strip() or "[Image]"
-                finally:
-                    os.unlink(tmp_path)
-                text_items.append(f"> [Image: {description}]")
+                description = _describe_image_crop(
+                    image.crop((x1, y1, x2, y2)), describe_script
+                )
+                if description:
+                    text_items.append(f"> [Image: {description}]")
+                else:
+                    text_items.append("> [Image]")
             else:
                 image_crop = image.crop((x1, y1, x2, y2))
                 image_base64 = PILimage_to_base64(image_crop)

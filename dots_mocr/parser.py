@@ -121,18 +121,18 @@ class DotsMOCRParser:
         )[0]
         return response
 
-    def _inference_with_vllm(self, image, prompt, prompt_mode):
+    def _inference_with_vllm(self, image, prompt, prompt_mode, temperature=None):
         system_prompt = "You are a helpful assistant."
         if prompt_mode != "prompt_general":
             system_prompt = None
         response = inference_with_vllm(
             image,
-            prompt, 
+            prompt,
             model_name=self.model_name,
             protocol=self.protocol,
             ip=self.ip,
             port=self.port,
-            temperature=self.temperature,
+            temperature=self.temperature if temperature is None else temperature,
             top_p=self.top_p,
             max_completion_tokens=self.max_completion_tokens,
             system_prompt=system_prompt,
@@ -188,12 +188,10 @@ class DotsMOCRParser:
         input_height, input_width = smart_resize(image.height, image.width)
         prompt = self.get_prompt(prompt_mode, bbox, origin_image, image, min_pixels=min_pixels, max_pixels=max_pixels, custom_prompt=custom_prompt)
         
-        if temperature != None:
-            self.temperature = temperature
         if self.use_hf:
             response = self._inference_with_hf(image, prompt)
         else:
-            response = self._inference_with_vllm(image, prompt, prompt_mode)
+            response = self._inference_with_vllm(image, prompt, prompt_mode, temperature=temperature)
         result = {'page_no': page_idx,
             "input_height": input_height,
             "input_width": input_width
