@@ -157,6 +157,48 @@ class DotsMOCRParser:
                 prompt = "Please describe the content of this image."
         return prompt
 
+    def _ocr_picture_cells(self, origin_image, cells):
+        """Fill in `text` for Picture cells by OCR-ing each cropped region.
+
+        The layout pass omits text for Picture cells by prompt instruction, so
+        image_mode="ocr" recovers it with one extra inference per picture.
+
+        Runs sequentially: pages already fan out across num_thread threads under
+        the API's MOCR_MAX_CONCURRENT semaphore, so parallel crops here would
+        multiply GPU concurrency again.
+
+        Never raises: a bad bbox or a failed inference logs a warning and leaves
+        the cell's text empty, so one picture cannot fail the whole page.
+        """
+        prompt = dict_promptmode_to_prompt["prompt_ocr"]
+        width, height = origin_image.width, origin_image.height
+
+        for cell in cells:
+            if cell.get('category') != 'Picture':
+                continue
+            try:
+                x1, y1, x2, y2 = [int(coord) for coord in cell['bbox']]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                if x2 <= x1 or y2 <= y1:
+                    logger.warning("skipping Picture cell with empty bbox: %s", cell.get('bbox'))
+                    continue
+
+                # Crops can fall below MIN_PIXELS; fetch_image upscales them to
+                # a size the model accepts.
+                crop = fetch_image(
+                    origin_image.crop((x1, y1, x2, y2)),
+                    min_pixels=MIN_PIXELS,
+                    max_pixels=MAX_PIXELS,
+                )
+                if self.use_hf:
+                    response = self._inference_with_hf(crop, prompt)
+                else:
+                    response = self._inference_with_vllm(crop, prompt, "prompt_ocr")
+                cell['text'] = (response or "").strip()
+            except Exception as e:
+                logger.warning("picture OCR failed for bbox %s: %s", cell.get('bbox'), e)
+
     # def post_process_results(self, response, prompt_mode, save_dir, save_name, origin_image, image, min_pixels, max_pixels)
     def _parse_single_image(
         self,
@@ -229,6 +271,12 @@ class DotsMOCRParser:
                     'filtered': True
                 })
             else:
+                # Before the json dump and both layoutjson2md passes, so the
+                # text reaches every output format and costs one call per
+                # picture rather than two.
+                if image_mode == "ocr" and prompt_mode != "prompt_layout_only_en":
+                    self._ocr_picture_cells(origin_image, cells)
+
                 try:
                     image_with_layout = draw_layout_on_image(origin_image, cells)
                 except Exception as e:

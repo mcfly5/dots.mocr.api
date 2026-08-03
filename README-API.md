@@ -303,6 +303,20 @@ The `image_mode` option controls how detected `Picture` layout cells are embedde
 | `base64` _(default)_ | `![](data:image/png;base64,...)` | Crops the region and inlines it as a data URI. Self-contained but increases response size. |
 | `file_ref` | `![](picture_0.png)` | Emits a filename placeholder — no image data is included. Useful when you handle images separately. |
 | `describe` | `> [Image: <description>]` | Calls `describe_script` with the cropped image path and embeds its stdout as text. |
+| `ocr` | the extracted text | Crops the region and runs it through OCR. The text replaces the image in `md_content` and also populates the cell's `text` field in the `json` output. Costs one extra model call per `Picture` cell. |
+
+**`ocr` mode notes:**
+
+The layout pass returns no text for `Picture` cells by design, so this mode issues
+one additional inference per picture, cropping the region and asking the model to
+extract its text. Use it for scanned figures, screenshots of tables, or stamped
+blocks whose text would otherwise be lost.
+
+Cost is one call per picture on top of the one call per page, and the calls are
+sequential within a page — a page with many figures takes proportionally longer.
+Pictures containing no text are dropped from the output entirely. If a call fails
+the cell is skipped with a logged warning and the rest of the conversion proceeds.
+Has no effect when `do_ocr` is `false` (detection-only mode produces no text).
 
 **`describe` mode setup:**
 
@@ -329,6 +343,13 @@ curl -s -X POST http://localhost:8003/v1/convert/file \
 curl -s -X POST http://localhost:8003/v1/convert/file \
   -F "files=@document.pdf" \
   -F 'options_json={"image_mode":"describe","describe_script":"scripts/describe_image.py","to_formats":["md"]}'
+```
+
+**Example — ocr mode:**
+```bash
+curl -s -X POST http://localhost:8003/v1/convert/file \
+  -F "files=@document.pdf" \
+  -F 'options_json={"image_mode":"ocr","to_formats":["md","json"]}'
 ```
 
 ---

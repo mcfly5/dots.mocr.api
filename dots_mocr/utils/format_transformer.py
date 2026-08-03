@@ -228,8 +228,10 @@ def layoutjson2md(
         text_key: The key for the text field in the cell dictionary.
         no_page_hf: If True, skips page headers and footers.
         image_mode: How to render Picture cells — "base64" (inline data URI),
-            "file_ref" (plain filename tag, no file written), or "describe"
-            (call describe_script and embed its stdout as text).
+            "file_ref" (plain filename tag, no file written), "describe"
+            (call describe_script and embed its stdout as text), or "ocr"
+            (emit the text the parser's picture OCR pass extracted, dropping
+            the image itself).
         describe_script: Script used when image_mode="describe". Must live in
             the repository's scripts/ directory. Called as:
             python <describe_script> <image_path>; stdout is the description.
@@ -250,6 +252,12 @@ def layoutjson2md(
         if cell['category'] == 'Picture':
             if image_mode == "file_ref":
                 text_items.append(f"![](picture_{picture_idx}.png)")
+            elif image_mode == "ocr":
+                # Text was filled in by the parser's picture OCR pass; skip the
+                # cell entirely when the picture held no text.
+                ocr_text = clean_text(text)
+                if ocr_text:
+                    text_items.append(ocr_text)
             elif image_mode == "describe" and describe_script:
                 description = _describe_image_crop(
                     image.crop((x1, y1, x2, y2)), describe_script
