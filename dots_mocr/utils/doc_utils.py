@@ -39,45 +39,46 @@ def get_matrix(page, dpi_default=200, max_pixels=11289600):
 
 def is_page_safe_to_render(page, max_image_pixels=30_000_000):
     """
-    检查一个页面是否包含可能导致内存问题的超大图片。
-    
+    Check whether a page contains an oversized image that could cause memory issues.
+
     Args:
-        page (pymupdf.Page): 要检查的页面对象。
-        max_image_pixels (int): 单个图片允许的最大像素数 (宽*高)。
-                                默认3000万像素，约对应 5000x6000 的图片，
-                                解压后约 120MB (RGBA)，是一个比较安全的上限。
+        page (pymupdf.Page): The page object to check.
+        max_image_pixels (int): Maximum allowed pixel count (width*height) for a
+                                single image. Defaults to 30M pixels, roughly a
+                                5000x6000 image (~120MB decompressed as RGBA),
+                                which is a fairly safe upper bound.
 
     Returns:
-        bool: 如果页面安全则返回 True，否则返回 False。
-        str: 包含原因的描述信息。
+        bool: True if the page is safe, otherwise False.
+        str: A human-readable reason describing the result.
     """
     image_list = page.get_images(full=True)
     if not image_list:
-        return True, "页面不含图片。"
+        return True, "Page contains no images."
 
     for img_index, img in enumerate(image_list):
         xref = img[0]
-        if xref == 0:  # 内联图片，通常较小，但也可以检查
+        if xref == 0:  # Inline image, usually small, but can still be checked.
             continue
-        
+
         try:
-            # 只获取图片信息，不解压！这是关键！
-            width = img[2]  # 直接从元数据获取宽度
-            height = img[3] # 直接从元数据获取高度
+            # Only read image metadata, do not decompress! This is the key point.
+            width = img[2]  # Width read directly from metadata.
+            height = img[3] # Height read directly from metadata.
 
             if width * height > max_image_pixels:
                 reason = (
-                    f"页面包含一个超大尺寸的内嵌图片 (xref: {xref}, "
-                    f"尺寸: {width}x{height})，像素数超过阈值 {max_image_pixels}。"
+                    f"Page contains an oversized embedded image (xref: {xref}, "
+                    f"size: {width}x{height}); pixel count exceeds threshold {max_image_pixels}."
                 )
                 return False, reason
-        
+
         except Exception as e:
-            # 如果连获取信息都失败，也标记为不安全
-            reason = f"检查图片 xref:{xref} 的元信息时出错: {e}"
+            # If even reading metadata fails, treat the page as unsafe.
+            reason = f"Error reading metadata of image xref:{xref}: {e}"
             return False, reason
-            
-    return True, "页面所有图片尺寸都在安全范围内。"
+
+    return True, "All image sizes on the page are within safe limits."
 
 def fitz_doc_to_image(doc, target_dpi=200, origin_dpi=None) -> dict:
     """Convert fitz.Document to image, Then convert the image to numpy array.

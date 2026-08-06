@@ -146,7 +146,7 @@ class DotsMOCRParser:
             bboxes = [bbox]
             bbox = pre_process_bboxes(origin_image, bboxes, input_width=image.width, input_height=image.height, min_pixels=min_pixels, max_pixels=max_pixels)[0]
             prompt = prompt + str(bbox)
-        if prompt_mode == 'prompt_image_to_svg':#如果是svg，需要把图片大小作为viewbox传进去
+        if prompt_mode == 'prompt_image_to_svg':  # for SVG, pass the image size in as the viewbox
             prompt = prompt.replace("{width}", str(origin_image.width))
             prompt = prompt.replace("{height}", str(origin_image.height))
             print(prompt)
@@ -309,19 +309,19 @@ class DotsMOCRParser:
         elif prompt_mode in ['prompt_scene_spotting']:
             instances, failed = post_process_scene_text(response, origin_image, image, min_pixels, max_pixels)
             
-            # 绘制可视化（失败则用原图）
+            # Draw visualization (fall back to the original image on failure).
             vis_image = origin_image if failed else draw_scene_text_on_image(origin_image, instances) if instances else origin_image
             
-            # 保存图片
+            # Save image
             image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
             vis_image.save(image_layout_path)
             
-            # 保存 JSON
+            # Save JSON
             json_file_path = os.path.join(save_dir, f"{save_name}.json")
             with open(json_file_path, 'w', encoding="utf-8") as f:
                 json.dump(instances if not failed else {"raw": response}, f, ensure_ascii=False, indent=2)
             
-            # 保存 Markdown
+            # Save Markdown
             md_content = format_scene_text_to_markdown(instances) if not failed else response
             md_file_path = os.path.join(save_dir, f"{save_name}.md")
             with open(md_file_path, "w", encoding="utf-8") as f:
@@ -339,29 +339,29 @@ class DotsMOCRParser:
             svg_content, has_svg = extract_svg_from_response(response)
             
             if has_svg:
-                # 转换 SVG 为 PN,保存原图长宽比缩放
+                # Convert SVG to PNG, preserving the original image aspect ratio.
                 png_path = os.path.join(save_dir, f"{save_name}_rendered.png")
                 w, h = origin_image.size
                 tw, th = (1024, round(h * 1024 / w)) if w <= h else (round(w * 1024 / h), 1024)
                 success, error = svg_to_png(svg_content, png_path, width=w, height=h)
                                 
                 if success:
-                    # 创建对比图：上面原图，下面渲染图
+                    # Build a comparison image: original on top, rendered below.
                     rendered_image = Image.open(png_path)
                     comparison_image = create_comparison_image(origin_image, rendered_image)
                     image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
                     comparison_image.save(image_layout_path)
                 else:
-                    # SVG 转换失败，保存原图
+                    # SVG conversion failed, save the original image.
                     print(f"SVG to PNG failed: {error}")
                     image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
                     origin_image.save(image_layout_path)        
             else:
-                # 没有 SVG，保存原图
+                # No SVG, save the original image.
                 image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
                 origin_image.save(image_layout_path)
             
-            # Markdown 直接放原始输出
+            # Markdown holds the raw model output directly.
             md_file_path = os.path.join(save_dir, f"{save_name}.md")
             md_content = f"# Generated SVG Code\n\n```xml\n{response}\n```"
             with open(md_file_path, "w", encoding="utf-8") as f:

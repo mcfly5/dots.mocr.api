@@ -3,15 +3,15 @@ import cairosvg
 from PIL import Image, ImageDraw, ImageFont 
 
 def fix_svg(svg: str) -> str:
-    """修复不完整的 SVG 标签"""
-    # 1) 定向补：末尾 <path d="... 这种 d 属性没闭合
+    """Repair incomplete SVG tags."""
+    # 1) Targeted fix: a trailing <path d="... where the d attribute is unclosed.
     if re.search(r'(<path\b[^>]*\bd="[^">]*$)', svg):
         svg += '">'
-    
-    # 2) 删除末尾残缺标签
+
+    # 2) Remove a truncated tag at the end.
     svg = re.sub(r'<[^>]*$', '', svg)
-    
-    # 3) 顺序扫描做栈匹配，补齐未闭合标签
+
+    # 3) Scan in order with a stack to close any unclosed tags.
     stack = []
     TAG_RE = re.compile(r'</?\s*([a-zA-Z][\w:-]*)\b[^>]*?/?>')
     for m in TAG_RE.finditer(svg):
@@ -31,32 +31,32 @@ def fix_svg(svg: str) -> str:
                 if stack and stack[-1] == name:
                     stack.pop()
     
-    # 4) 补齐剩余未闭合
+    # 4) Close any remaining unclosed tags.
     while stack:
         svg += f'</{stack.pop()}>'
-    
+
     return svg
 
 
 def extract_svg_from_response(response: str):
-    """从模型响应中提取 SVG 内容，返回 (svg_content, success)"""
+    """Extract SVG content from the model response, returns (svg_content, success)."""
     response = response.replace("svg:", "").strip()
-    
-    # 尝试匹配完整的 <svg>...</svg>
+
+    # Try to match a complete <svg>...</svg>.
     svg_match = re.search(r'<svg[^>]*>(.*?)</svg>', response, re.DOTALL)
     if svg_match:
         return svg_match.group(0), True
-    
-    # 尝试匹配不完整的 SVG
+
+    # Try to match an incomplete SVG.
     svg_match = re.search(r'<svg[^>]*>.*', response, re.DOTALL)
     if svg_match:
         return fix_svg(svg_match.group(0)), True
-    
+
     return None, False
 
 
 def svg_to_png(svg_content: str, output_path: str, width: int = 1024, height: int = 1024):
-    """将 SVG 转换为 PNG 图片"""
+    """Convert SVG to a PNG image."""
     import cairosvg
     try:
         cairosvg.svg2png(
@@ -71,38 +71,38 @@ def svg_to_png(svg_content: str, output_path: str, width: int = 1024, height: in
         return False, str(e)
 
 def _add_label(image: Image.Image, label: str, font_size: int = 24) -> Image.Image:
-    """在图片右上角添加标签"""
+    """Add a label to the top-right corner of the image."""
     draw = ImageDraw.Draw(image)
-    
-    # 加载字体（优先使用粗体）
+
+    # Load font (prefer bold).
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
     except:
-        font = ImageFont.load_default()  # 找不到就用默认字体
-    
-    # 计算文字位置（右上角）
+        font = ImageFont.load_default()  # fall back to the default font if not found
+
+    # Compute text position (top-right corner).
     padding = 10
     bbox = draw.textbbox((0, 0), label, font=font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
-    
-    x = image.width - text_width - padding * 2  # 靠右
-    y = padding  # 靠上
-    
-    # 绘制半透明黑色背景
+
+    x = image.width - text_width - padding * 2  # align right
+    y = padding  # align top
+
+    # Draw a translucent black background.
     overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
     overlay_draw.rectangle(
         [x - padding, y - padding, x + text_width + padding, y + text_height + padding],
-        fill=(0, 0, 0, 180)  # 黑色，180 表示透明度
+        fill=(0, 0, 0, 180)  # black, 180 is the opacity
     )
-    
-    # 合并背景层
+
+    # Merge the background layer.
     if image.mode != 'RGBA':
         image = image.convert('RGBA')
     image = Image.alpha_composite(image, overlay)
-    
-    # 绘制白色文字
+
+    # Draw the white text.
     draw = ImageDraw.Draw(image)
     draw.text((x, y), label, font=font, fill=(255, 255, 255, 255))
     
@@ -113,64 +113,64 @@ def create_comparison_image(original_image, rendered_image, gap=10,
                             top_label: str = "Origin", 
                             bottom_label: str = "Generated"):
     """
-    创建对比图：上面原图，下面渲染图，并添加标签
-    
+    Create a comparison image: original on top, rendered below, with labels.
+
     Args:
-        original_image: PIL Image，原图
-        rendered_image: PIL Image 或路径，渲染后的图片
-        gap: 两张图之间的间隔高度（像素）
-        top_label: 上图标签，默认 "Origin"
-        bottom_label: 下图标签，默认 "Generated"
-    
+        original_image: PIL Image, the original image.
+        rendered_image: PIL Image or path, the rendered image.
+        gap: Gap height between the two images (pixels).
+        top_label: Top image label, defaults to "Origin".
+        bottom_label: Bottom image label, defaults to "Generated".
+
     Returns:
-        PIL Image: 拼接后的对比图
+        PIL Image: The stitched comparison image.
     """
     if isinstance(rendered_image, str):
         rendered_image = Image.open(rendered_image)
-    
-    # 统一宽度，按比例缩放
+
+    # Unify width, scaling proportionally.
     target_width = max(original_image.width, rendered_image.width)
-    
-    # 缩放原图
+
+    # Scale the original image.
     if original_image.width != target_width:
         scale = target_width / original_image.width
         new_height = int(original_image.height * scale)
         original_image = original_image.resize((target_width, new_height), Image.LANCZOS)
-    
-    # 缩放渲染图
+
+    # Scale the rendered image.
     if rendered_image.width != target_width:
         scale = target_width / rendered_image.width
         new_height = int(rendered_image.height * scale)
         rendered_image = rendered_image.resize((target_width, new_height), Image.LANCZOS)
-    
-    # ===== 新增：转换为 RGBA 模式以便添加标签 =====
+
+    # Convert to RGBA mode so labels can be added.
     if original_image.mode != 'RGBA':
         original_image = original_image.convert('RGBA')
     if rendered_image.mode != 'RGBA':
         rendered_image = rendered_image.convert('RGBA')
-    
-    # ===== 新增：添加标签 =====
+
+    # Add labels.
     original_image = _add_label(original_image, top_label)
     rendered_image = _add_label(rendered_image, bottom_label)
-    
-    # ===== 修改：转回 RGB 模式进行拼接 =====
+
+    # Convert back to RGB mode for stitching.
     if original_image.mode == 'RGBA':
         bg = Image.new('RGB', original_image.size, (255, 255, 255))
         bg.paste(original_image, mask=original_image.split()[3])
         original_image = bg
-    
+
     if rendered_image.mode == 'RGBA':
         bg = Image.new('RGB', rendered_image.size, (255, 255, 255))
         bg.paste(rendered_image, mask=rendered_image.split()[3])
         rendered_image = bg
-    
-    # 计算拼接后的尺寸
+
+    # Compute the stitched dimensions.
     total_height = original_image.height + gap + rendered_image.height
-    
-    # 创建空白画布
+
+    # Create a blank canvas.
     comparison = Image.new('RGB', (target_width, total_height), (255, 255, 255))
-    
-    # 粘贴两张图：上面原图，下面渲染图
+
+    # Paste the two images: original on top, rendered below.
     comparison.paste(original_image, (0, 0))
     comparison.paste(rendered_image, (0, original_image.height + gap))
     
