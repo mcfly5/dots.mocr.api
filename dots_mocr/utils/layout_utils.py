@@ -10,6 +10,7 @@ from dots_mocr.utils.image_utils import smart_resize
 from dots_mocr.utils.consts import MIN_PIXELS, MAX_PIXELS
 from dots_mocr.utils.output_cleaner import OutputCleaner
 from dots_mocr.utils.doc_utils import FITZ_LOCK
+from dots_mocr.log import logger
 
 
 # Define a color map (using RGBA format)
@@ -207,21 +208,27 @@ def post_process_output(response, prompt_mode, origin_image, input_image, min_pi
     if prompt_mode in ["prompt_ocr", "prompt_table_html", "prompt_table_latex", "prompt_formula_latex"]:
         return response
 
+    logger.debug(
+        "post_process_output: prompt_mode={} response_len={}",
+        prompt_mode, len(response) if isinstance(response, str) else "n/a",
+    )
+
     json_load_failed = False
     cells = response
     try:
         cells = json.loads(cells)
         cells = post_process_cells(
-            origin_image, 
+            origin_image,
             cells,
             input_image.width,
             input_image.height,
             min_pixels=min_pixels,
             max_pixels=max_pixels
         )
+        logger.debug("post_process_output: parsed {} cells", len(cells))
         return cells, False
     except Exception as e:
-        print(f"cells post process error: {e}, when using {prompt_mode}")
+        logger.warning("cells post process error: {}, when using {}", e, prompt_mode)
         json_load_failed = True
 
     if json_load_failed:
@@ -229,6 +236,10 @@ def post_process_output(response, prompt_mode, origin_image, input_image, min_pi
         response_clean = cleaner.clean_model_output(cells)
         if isinstance(response_clean, list):
             response_clean = "\n\n".join([cell['text'] for cell in response_clean if 'text' in cell])
+        logger.warning(
+            "post_process_output: using filtered fallback (OutputCleaner), text_len={}",
+            len(response_clean) if isinstance(response_clean, str) else "n/a",
+        )
         return response_clean, True
 
 

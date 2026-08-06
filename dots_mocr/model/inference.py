@@ -1,8 +1,10 @@
 import os
 import threading
+import time
 
 from openai import OpenAI
 
+from dots_mocr.log import logger
 from dots_mocr.utils.image_utils import PILimage_to_base64
 
 # Per-request timeout for vLLM inference calls. Without one, the OpenAI SDK
@@ -57,10 +59,26 @@ def inference_with_vllm(
             ],
         }
     )
+    logger.debug(
+        "vllm request: addr={} model={} temperature={} top_p={} max_tokens={} "
+        "image={}x{} prompt_len={}",
+        addr, model_name, temperature, top_p, max_completion_tokens,
+        getattr(image, "width", "?"), getattr(image, "height", "?"), len(prompt),
+    )
+    start = time.monotonic()
+    # Deliberately unguarded: failures propagate to the caller so the API layer
+    # (dots_mocr/api/engine.py) can log and surface them, rather than turning a
+    # wedged vLLM into a silently empty page.
     response = client.chat.completions.create(
         messages=messages,
         model=model_name,
         max_completion_tokens=max_completion_tokens,
         temperature=temperature,
         top_p=top_p)
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    elapsed = time.monotonic() - start
+    if not content:
+        logger.warning("vllm response empty (model={}) in {:.2f}s", model_name, elapsed)
+    else:
+        logger.debug("vllm response: len={} in {:.2f}s", len(content), elapsed)
+    return content

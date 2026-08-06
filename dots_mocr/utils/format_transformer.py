@@ -1,14 +1,12 @@
 import os
 import sys
 import json
-import logging
 import re
 from pathlib import Path
 
 from PIL import Image
+from dots_mocr.log import logger
 from dots_mocr.utils.image_utils import PILimage_to_base64
-
-logger = logging.getLogger("uvicorn.error")
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 
@@ -183,7 +181,7 @@ def _describe_image_crop(image_crop: Image.Image, describe_script: str) -> str:
     try:
         script = resolve_describe_script(describe_script)
     except ValueError as e:
-        logger.warning("describe_script rejected: %s", e)
+        logger.warning("describe_script rejected: {}", e)
         return ""
 
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
@@ -196,13 +194,13 @@ def _describe_image_crop(image_crop: Image.Image, describe_script: str) -> str:
         )
         if proc.returncode != 0:
             logger.warning(
-                "describe_script %s exited %d: %s",
+                "describe_script {} exited {}: {}",
                 script, proc.returncode, proc.stderr.strip(),
             )
             return ""
         return proc.stdout.strip()
     except (OSError, subprocess.TimeoutExpired) as e:
-        logger.warning("describe_script %s failed: %s", script, e)
+        logger.warning("describe_script {} failed: {}", script, e)
         return ""
     finally:
         try:
@@ -278,6 +276,10 @@ def layoutjson2md(
             text_items.append(f"{text}")
 
     markdown_text = '\n\n'.join(text_items)
+    logger.debug(
+        "layoutjson2md: cells={} pictures={} image_mode={} no_page_hf={} md_chars={}",
+        len(cells), picture_idx, image_mode, no_page_hf, len(markdown_text),
+    )
     return markdown_text
 
 

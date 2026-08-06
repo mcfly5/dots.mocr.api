@@ -1,12 +1,11 @@
 import fitz
-import logging
 import threading
 import numpy as np
 import enum
 from pydantic import BaseModel, Field
 from PIL import Image
 
-logger = logging.getLogger("uvicorn.error")
+from dots_mocr.log import logger
 
 
 # PyMuPDF / MuPDF is not thread-safe for concurrent document open/render.
@@ -94,13 +93,21 @@ def fitz_doc_to_image(doc, target_dpi=200, origin_dpi=None) -> dict:
     # mat = fitz.Matrix(target_dpi / 72, target_dpi / 72)
     mat = get_matrix(doc, target_dpi)
     pm = doc.get_pixmap(matrix=mat, alpha=False)
+    logger.debug(
+        "fitz_doc_to_image: target_dpi={} matrix=({:.3f},{:.3f}) pixmap={}x{}",
+        target_dpi, mat.a, mat.d, pm.width, pm.height,
+    )
     if pm.width == 0 or pm.height == 0:
-        print(f"image is empty loading from pdf, skip")
+        logger.warning("fitz_doc_to_image: empty pixmap ({}x{}), skip", pm.width, pm.height)
         return None
-        
+
     if pm.width > 4500 or pm.height > 4500:
         mat = fitz.Matrix(72 / 72, 72 / 72)  # use fitz default dpi
         pm = doc.get_pixmap(matrix=mat, alpha=False)
+        logger.debug(
+            "fitz_doc_to_image: oversized page re-rendered at 72 dpi -> {}x{}",
+            pm.width, pm.height,
+        )
 
     image = Image.frombytes('RGB', (pm.width, pm.height), pm.samples)
     return image
@@ -113,7 +120,7 @@ def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -
     with FITZ_LOCK, fitz.open(pdf_file) as doc:
         pdf_page_num = doc.page_count
         logger.debug(
-            "load_images_from_pdf: file=%s page_count=%d dpi=%d range=[%s,%s]",
+            "load_images_from_pdf: file={} page_count={} dpi={} range=[{},{}]",
             pdf_file, pdf_page_num, dpi, start_page_id, end_page_id,
         )
         end_page_id = (
@@ -132,19 +139,23 @@ def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -
                 if not is_safe:
                     # Skip only this page rather than discarding the whole document.
                     logger.warning(
-                        "pdf page %d of %s is not safe to render, skip: %s",
+                        "pdf page {} of {} is not safe to render, skip: {}",
                         index, pdf_file, reason,
                     )
                     skipped_unsafe += 1
                     continue
                 img = fitz_doc_to_image(page, target_dpi=dpi)
                 if img is None:
-                    logger.warning("pdf page %d of %s is empty, skip", index, pdf_file)
+                    logger.warning("pdf page {} of {} is empty, skip", index, pdf_file)
                     skipped_empty += 1
                     continue
+                logger.debug(
+                    "load_images_from_pdf: page {} rendered -> {}x{}",
+                    index, img.width, img.height,
+                )
                 images.append(img)
     logger.info(
-        "load_images_from_pdf: file=%s rendered=%d skipped_unsafe=%d skipped_empty=%d",
+        "load_images_from_pdf: file={} rendered={} skipped_unsafe={} skipped_empty={}",
         pdf_file, len(images), skipped_unsafe, skipped_empty,
     )
     return images
