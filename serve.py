@@ -13,8 +13,10 @@ Environment variables (all optional):
     MOCR_API_KEY      enables X-API-Key auth when set
     MOCR_OUTPUT_DIR   base dir for temp output (default: /tmp/mocr_output)
     MOCR_TASK_TTL     async task TTL in secs   (default: 3600)
+    MOCR_LOG_LEVEL    debug|info|warning|error (default: info)
 """
 import argparse
+import os
 
 import uvicorn
 
@@ -32,13 +34,15 @@ def main() -> None:
     parser.add_argument("--reload", action="store_true", help="Enable hot-reload (dev only)")
     args = parser.parse_args()
 
+    # Same variable the engine's loguru sink reads (dots_mocr/log.py), so one
+    # knob raises verbosity across both the API layer and the OCR pipeline.
     uvicorn.run(
         "dots_mocr.api.app:app",
         host=args.host,
         port=args.port,
         workers=args.workers,
         reload=args.reload,
-        log_level="info",
+        log_level=os.environ.get("MOCR_LOG_LEVEL", "info").lower(),
     )
 
 

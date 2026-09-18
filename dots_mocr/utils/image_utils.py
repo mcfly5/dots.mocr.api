@@ -5,6 +5,7 @@ from typing import Tuple
 import os
 from dots_mocr.utils.consts import IMAGE_FACTOR, MIN_PIXELS, MAX_PIXELS
 from dots_mocr.utils.doc_utils import fitz_doc_to_image, FITZ_LOCK
+from dots_mocr.log import logger
 from io import BytesIO
 import fitz
 import requests
@@ -136,6 +137,10 @@ def fetch_image(
         )
         assert resized_height>0 and resized_width>0, f"resized_height: {resized_height}, resized_width: {resized_width}, min_pixels: {min_pixels}, max_pixels:{max_pixels}, width: {width}, height:{height}, "
         image = image.resize((resized_width, resized_height))
+        logger.debug(
+            "fetch_image: resized {}x{} -> {}x{} (min_pixels={} max_pixels={})",
+            width, height, resized_width, resized_height, min_pixels, max_pixels,
+        )
 
     return image
 

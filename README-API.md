@@ -74,6 +74,7 @@ All settings are via environment variables. None are required — defaults work 
 | `MOCR_API_KEY` | _(unset)_ | When set, enables API key auth on all `/v1` endpoints |
 | `MOCR_OUTPUT_DIR` | `/tmp/mocr_output` | Base directory for temporary output files |
 | `MOCR_TASK_TTL` | `3600` | Seconds to retain async task records in memory |
+| `MOCR_LOG_LEVEL` | `info` | Log verbosity for both the API layer and the OCR pipeline. Set to `debug` to trace every stage (page render, vLLM request/response timing, layout parsing, markdown output) |
 
 **Example with auth enabled:**
 ```bash

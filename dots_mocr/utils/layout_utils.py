@@ -10,6 +10,7 @@ from dots_mocr.utils.image_utils import smart_resize
 from dots_mocr.utils.consts import MIN_PIXELS, MAX_PIXELS
 from dots_mocr.utils.output_cleaner import OutputCleaner
 from dots_mocr.utils.doc_utils import FITZ_LOCK
+from dots_mocr.log import logger
 
 
 # Define a color map (using RGBA format)
@@ -207,21 +208,27 @@ def post_process_output(response, prompt_mode, origin_image, input_image, min_pi
     if prompt_mode in ["prompt_ocr", "prompt_table_html", "prompt_table_latex", "prompt_formula_latex"]:
         return response
 
+    logger.debug(
+        "post_process_output: prompt_mode={} response_len={}",
+        prompt_mode, len(response) if isinstance(response, str) else "n/a",
+    )
+
     json_load_failed = False
     cells = response
     try:
         cells = json.loads(cells)
         cells = post_process_cells(
-            origin_image, 
+            origin_image,
             cells,
             input_image.width,
             input_image.height,
             min_pixels=min_pixels,
             max_pixels=max_pixels
         )
+        logger.debug("post_process_output: parsed {} cells", len(cells))
         return cells, False
     except Exception as e:
-        print(f"cells post process error: {e}, when using {prompt_mode}")
+        logger.warning("cells post process error: {}, when using {}", e, prompt_mode)
         json_load_failed = True
 
     if json_load_failed:
@@ -229,19 +236,23 @@ def post_process_output(response, prompt_mode, origin_image, input_image, min_pi
         response_clean = cleaner.clean_model_output(cells)
         if isinstance(response_clean, list):
             response_clean = "\n\n".join([cell['text'] for cell in response_clean if 'text' in cell])
+        logger.warning(
+            "post_process_output: using filtered fallback (OutputCleaner), text_len={}",
+            len(response_clean) if isinstance(response_clean, str) else "n/a",
+        )
         return response_clean, True
 
 
 # ========== Scene Text Visualization ==========
 def parse_scene_text_output(response: str) -> List[Dict]:
-    """解析场景文本输出，格式: (x1, y1), (x2, y2), (x3, y3), (x4, y4) text"""
+    """Parse scene-text output, format: (x1, y1), (x2, y2), (x3, y3), (x4, y4) text"""
     pattern = re.compile(
-        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*'  # 点1
-        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*'  # 点2
-        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*'  # 点3
-        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*'      # 点4
-        r'(.*?)'                               # 文本内容（非贪婪）
-        r'(?=\(\s*\d+\s*,\s*\d+\s*\)|\Z)',     # 下一个坐标点开始或结束
+        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*'  # point 1
+        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*'  # point 2
+        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*'  # point 3
+        r'\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*'      # point 4
+        r'(.*?)'                               # text content (non-greedy)
+        r'(?=\(\s*\d+\s*,\s*\d+\s*\)|\Z)',     # next coordinate point or end of string
         re.DOTALL
     )
 
@@ -254,7 +265,7 @@ def parse_scene_text_output(response: str) -> List[Dict]:
     return results
 
 def post_process_scene_text(response, origin_image, input_image, min_pixels=None, max_pixels=None):
-    """坐标反算：从模型输出坐标映射回原图"""
+    """Inverse coordinate mapping: map model output coordinates back to the original image."""
     instances = parse_scene_text_output(response)
     if not instances:
         return response, True
@@ -278,7 +289,7 @@ def post_process_scene_text(response, origin_image, input_image, min_pixels=None
     return instances, False
 
 def draw_scene_text_on_image(image, instances):
-    """绘制场景文本：绿色多边形框 + 白色文字标签"""
+    """Draw scene text: green polygon boxes + white text labels."""
     import cv2
     import numpy as np
     
@@ -297,13 +308,13 @@ def draw_scene_text_on_image(image, instances):
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 def format_scene_text_to_markdown(instances):
-    """格式化为 Markdown，保留原始坐标格式"""
+    """Format as Markdown, preserving the original coordinate format."""
     if isinstance(instances, str):
         return instances
     lines = []
     for inst in instances:
         pts = inst['points']
-        # 格式: (x1, y1), (x2, y2), (x3, y3), (x4, y4) text
+        # format: (x1, y1), (x2, y2), (x3, y3), (x4, y4) text
         coord_str = f"({pts[0]}, {pts[1]}), ({pts[2]}, {pts[3]}), ({pts[4]}, {pts[5]}), ({pts[6]}, {pts[7]})"
         lines.append(f"{coord_str} {inst['text']}\n")
     return "# Scene Text Results\n\n" + "\n".join(lines)

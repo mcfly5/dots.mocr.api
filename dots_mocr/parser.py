@@ -1,13 +1,12 @@
 import os
 import json
-import logging
 import time
 from tqdm import tqdm
 from multiprocessing.pool import ThreadPool, Pool
 import argparse
 from PIL import Image
 
-logger = logging.getLogger("uvicorn.error")
+from dots_mocr.log import logger
 
 from dots_mocr.model.inference import inference_with_vllm
 from dots_mocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
@@ -58,9 +57,9 @@ class DotsMOCRParser:
         self.use_hf = use_hf
         if self.use_hf:
             self._load_hf_model()
-            print(f"use hf model, num_thread will be set to 1")
+            logger.info("use hf model, num_thread will be set to 1")
         else:
-            print(f"use vllm model, num_thread will be set to {self.num_thread}")
+            logger.info("use vllm model, num_thread will be set to {}", self.num_thread)
         assert self.min_pixels is None or self.min_pixels >= MIN_PIXELS
         assert self.max_pixels is None or self.max_pixels <= MAX_PIXELS
 
@@ -146,10 +145,10 @@ class DotsMOCRParser:
             bboxes = [bbox]
             bbox = pre_process_bboxes(origin_image, bboxes, input_width=image.width, input_height=image.height, min_pixels=min_pixels, max_pixels=max_pixels)[0]
             prompt = prompt + str(bbox)
-        if prompt_mode == 'prompt_image_to_svg':#如果是svg，需要把图片大小作为viewbox传进去
+        if prompt_mode == 'prompt_image_to_svg':  # for SVG, pass the image size in as the viewbox
             prompt = prompt.replace("{width}", str(origin_image.width))
             prompt = prompt.replace("{height}", str(origin_image.height))
-            print(prompt)
+            logger.debug("svg prompt: {}", prompt)
         if prompt_mode == 'prompt_general':
             if custom_prompt:
                 prompt = custom_prompt
@@ -181,7 +180,7 @@ class DotsMOCRParser:
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(width, x2), min(height, y2)
                 if x2 <= x1 or y2 <= y1:
-                    logger.warning("skipping Picture cell with empty bbox: %s", cell.get('bbox'))
+                    logger.warning("skipping Picture cell with empty bbox: {}", cell.get('bbox'))
                     continue
 
                 # Crops can fall below MIN_PIXELS; fetch_image upscales them to
@@ -197,7 +196,7 @@ class DotsMOCRParser:
                     response = self._inference_with_vllm(crop, prompt, "prompt_ocr")
                 cell['text'] = (response or "").strip()
             except Exception as e:
-                logger.warning("picture OCR failed for bbox %s: %s", cell.get('bbox'), e)
+                logger.warning("picture OCR failed for bbox {}: {}", cell.get('bbox'), e)
 
     # def post_process_results(self, response, prompt_mode, save_dir, save_name, origin_image, image, min_pixels, max_pixels)
     def _parse_single_image(
@@ -229,11 +228,28 @@ class DotsMOCRParser:
             image = fetch_image(origin_image, min_pixels=min_pixels, max_pixels=max_pixels)
         input_height, input_width = smart_resize(image.height, image.width)
         prompt = self.get_prompt(prompt_mode, bbox, origin_image, image, min_pixels=min_pixels, max_pixels=max_pixels, custom_prompt=custom_prompt)
-        
+
+        logger.debug(
+            "parse page: source={} page_idx={} origin={}x{} resized={}x{} "
+            "min_pixels={} max_pixels={} prompt_mode={} prompt_len={}",
+            source, page_idx, origin_image.width, origin_image.height,
+            input_width, input_height, min_pixels, max_pixels, prompt_mode, len(prompt),
+        )
+
         if self.use_hf:
             response = self._inference_with_hf(image, prompt)
         else:
             response = self._inference_with_vllm(image, prompt, prompt_mode, temperature=temperature)
+        if not response:
+            logger.warning(
+                "inference returned empty response: source={} page_idx={} prompt_mode={}",
+                source, page_idx, prompt_mode,
+            )
+        else:
+            logger.debug(
+                "inference response: source={} page_idx={} len={} preview={!r}",
+                source, page_idx, len(response), response[:120],
+            )
         result = {'page_no': page_idx,
             "input_height": input_height,
             "input_width": input_width
@@ -250,6 +266,10 @@ class DotsMOCRParser:
                 max_pixels=max_pixels,
                 )
             if filtered and prompt_mode != 'prompt_layout_only_en':  # model output json failed, use filtered process
+                logger.debug(
+                    "layout branch=filtered (json parse failed) page_idx={} md_chars={}",
+                    page_idx, len(cells) if isinstance(cells, str) else 0,
+                )
                 json_file_path = os.path.join(save_dir, f"{save_name}.json")
                 with open(json_file_path, 'w', encoding="utf-8") as w:
                     json.dump(response, w, ensure_ascii=False)
@@ -271,6 +291,11 @@ class DotsMOCRParser:
                     'filtered': True
                 })
             else:
+                logger.debug(
+                    "layout branch={} page_idx={} cells={}",
+                    "layout_only" if prompt_mode == "prompt_layout_only_en" else "normal",
+                    page_idx, len(cells) if isinstance(cells, list) else "n/a",
+                )
                 # Before the json dump and both layoutjson2md passes, so the
                 # text reaches every output format and costs one call per
                 # picture rather than two.
@@ -280,7 +305,7 @@ class DotsMOCRParser:
                 try:
                     image_with_layout = draw_layout_on_image(origin_image, cells)
                 except Exception as e:
-                    print(f"Error drawing layout on image: {e}")
+                    logger.warning("Error drawing layout on image: {}", e)
                     image_with_layout = origin_image
 
                 json_file_path = os.path.join(save_dir, f"{save_name}.json")
@@ -302,6 +327,10 @@ class DotsMOCRParser:
                     md_nohf_file_path = os.path.join(save_dir, f"{save_name}_nohf.md")
                     with open(md_nohf_file_path, "w", encoding="utf-8") as md_file:
                         md_file.write(md_content_no_hf)
+                    logger.debug(
+                        "markdown written: page_idx={} md_chars={} -> {}",
+                        page_idx, len(md_content), md_file_path,
+                    )
                     result.update({
                         'md_content_path': md_file_path,
                         'md_content_nohf_path': md_nohf_file_path,
@@ -309,19 +338,19 @@ class DotsMOCRParser:
         elif prompt_mode in ['prompt_scene_spotting']:
             instances, failed = post_process_scene_text(response, origin_image, image, min_pixels, max_pixels)
             
-            # 绘制可视化（失败则用原图）
+            # Draw visualization (fall back to the original image on failure).
             vis_image = origin_image if failed else draw_scene_text_on_image(origin_image, instances) if instances else origin_image
             
-            # 保存图片
+            # Save image
             image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
             vis_image.save(image_layout_path)
             
-            # 保存 JSON
+            # Save JSON
             json_file_path = os.path.join(save_dir, f"{save_name}.json")
             with open(json_file_path, 'w', encoding="utf-8") as f:
                 json.dump(instances if not failed else {"raw": response}, f, ensure_ascii=False, indent=2)
             
-            # 保存 Markdown
+            # Save Markdown
             md_content = format_scene_text_to_markdown(instances) if not failed else response
             md_file_path = os.path.join(save_dir, f"{save_name}.md")
             with open(md_file_path, "w", encoding="utf-8") as f:
@@ -339,29 +368,29 @@ class DotsMOCRParser:
             svg_content, has_svg = extract_svg_from_response(response)
             
             if has_svg:
-                # 转换 SVG 为 PN,保存原图长宽比缩放
+                # Convert SVG to PNG, preserving the original image aspect ratio.
                 png_path = os.path.join(save_dir, f"{save_name}_rendered.png")
                 w, h = origin_image.size
                 tw, th = (1024, round(h * 1024 / w)) if w <= h else (round(w * 1024 / h), 1024)
                 success, error = svg_to_png(svg_content, png_path, width=w, height=h)
                                 
                 if success:
-                    # 创建对比图：上面原图，下面渲染图
+                    # Build a comparison image: original on top, rendered below.
                     rendered_image = Image.open(png_path)
                     comparison_image = create_comparison_image(origin_image, rendered_image)
                     image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
                     comparison_image.save(image_layout_path)
                 else:
-                    # SVG 转换失败，保存原图
-                    print(f"SVG to PNG failed: {error}")
+                    # SVG conversion failed, save the original image.
+                    logger.warning("SVG to PNG failed: {}", error)
                     image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
                     origin_image.save(image_layout_path)        
             else:
-                # 没有 SVG，保存原图
+                # No SVG, save the original image.
                 image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
                 origin_image.save(image_layout_path)
             
-            # Markdown 直接放原始输出
+            # Markdown holds the raw model output directly.
             md_file_path = os.path.join(save_dir, f"{save_name}.md")
             md_content = f"# Generated SVG Code\n\n```xml\n{response}\n```"
             with open(md_file_path, "w", encoding="utf-8") as f:
@@ -395,11 +424,11 @@ class DotsMOCRParser:
         return [result]
         
     def parse_pdf(self, input_path, filename, prompt_mode, save_dir, image_mode="base64", describe_script=None):
-        logger.info("loading pdf: %s (prompt_mode=%s)", input_path, prompt_mode)
+        logger.info("loading pdf: {} (prompt_mode={})", input_path, prompt_mode)
         images_origin = load_images_from_pdf(input_path, dpi=self.dpi)
         total_pages = len(images_origin)
         if total_pages == 0:
-            logger.warning("No renderable pages found in %s", input_path)
+            logger.warning("No renderable pages found in {}", input_path)
             return []
         tasks = [
             {
@@ -422,7 +451,7 @@ class DotsMOCRParser:
         else:
             num_thread = min(total_pages, self.num_thread)
         logger.info(
-            "Parsing PDF %s with %d pages using %d threads...",
+            "Parsing PDF {} with {} pages using {} threads...",
             input_path, total_pages, num_thread,
         )
 
@@ -431,10 +460,16 @@ class DotsMOCRParser:
         with ThreadPool(num_thread) as pool:
             with tqdm(total=total_pages, desc="Processing PDF pages") as pbar:
                 for result in pool.imap_unordered(_execute_task, tasks):
+                    logger.debug(
+                        "page done: page_no={} has_md={} filtered={}",
+                        result.get("page_no"),
+                        bool(result.get("md_content_path")),
+                        result.get("filtered", False),
+                    )
                     results.append(result)
                     pbar.update(1)
         logger.info(
-            "Parsed PDF %s: %d/%d pages in %.2fs",
+            "Parsed PDF {}: {}/{} pages in {:.2f}s",
             input_path, len(results), total_pages, time.monotonic() - start,
         )
 
@@ -464,7 +499,7 @@ class DotsMOCRParser:
         else:
             raise ValueError(f"file extension {file_ext} not supported, supported extensions are {image_extensions} and pdf")
         
-        print(f"Parsing finished, results saving to {save_dir}")
+        logger.info("Parsing finished, results saving to {}", save_dir)
         with open(os.path.join(output_dir, os.path.basename(filename)+'.jsonl'), 'w', encoding="utf-8") as w:
             for result in results:
                 w.write(json.dumps(result, ensure_ascii=False) + '\n')
