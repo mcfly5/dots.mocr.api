@@ -11,7 +11,6 @@ import re
 import shutil
 import tempfile
 import time
-from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 from urllib.parse import urlparse
@@ -29,7 +28,10 @@ from dots_mocr.api.datamodel.requests import (
     HttpSourceRequest,
 )
 from dots_mocr.api.datamodel.responses import (
+    FATAL_ERROR_CODES,
     ConvertDocumentResponse,
+    ConvertFailureDetail,
+    DocumentErrorSummary,
     ErrorItem,
     ExportDocumentResponse,
 )
@@ -73,77 +75,127 @@ def _extract_plain_text(md: str) -> str:
     return text.strip()
 
 
+_FAILED_PAGE_MD = "<!-- dots.mocr: page {page_no} failed ({code}) -->"
+
+# Distinguishes "this page has no json at all" (e.g. an SVG prompt mode) from
+# "this page's json is missing because it failed", which is serialised as null.
+_NO_JSON = object()
+
+
 def _assemble_outputs(
     results: list[dict], to_formats: list[str]
-) -> tuple[Optional[str], Optional[list]]:
-    md_parts: list[str] = []
-    json_pages: list = []
+) -> tuple[Optional[str], Optional[list], list[ErrorItem], int]:
+    """Join the per-page artifacts and report what went wrong on the way.
+
+    Failed pages keep their slot — a marker in the markdown, ``null`` in the json
+    list — so ``json_content[i]`` still lines up with the page carrying
+    ``errors[].page_no``.
+    """
+    md_slots: list[Optional[str]] = []
+    json_slots: list = []
+    errors: list[ErrorItem] = []
+    pages_ok = 0
+    md_from_page = False
 
     for r in results:
-        if "md" in to_formats and r.get("md_content_path"):
+        page_no = r.get("page_no")
+        error = r.get("error")
+
+        if error:
+            code = error.get("code") or "page_failed"
+            errors.append(
+                ErrorItem(
+                    message=error.get("message") or "page processing failed",
+                    code=code,
+                    page_no=page_no,
+                )
+            )
+            md_slots.append(_FAILED_PAGE_MD.format(page_no=page_no, code=code))
+            json_slots.append(None)
+            continue
+
+        pages_ok += 1
+        if r.get("filtered"):
+            errors.append(
+                ErrorItem(
+                    message=(
+                        "layout json could not be parsed; text recovered by the "
+                        "fallback cleaner, no layout for this page"
+                    ),
+                    code="page_degraded",
+                    page_no=page_no,
+                )
+            )
+        if r.get("empty_response"):
+            errors.append(
+                ErrorItem(
+                    message="the model returned an empty response for this page",
+                    code="page_empty_response",
+                    page_no=page_no,
+                )
+            )
+        if r.get("fallback_model"):
+            errors.append(
+                ErrorItem(
+                    message=(
+                        "main model unavailable; page processed by fallback "
+                        f"model {r['fallback_model']}"
+                    ),
+                    code="page_fallback_model",
+                    page_no=page_no,
+                )
+            )
+
+        md_path = r.get("md_content_path") if "md" in to_formats else None
+        if md_path:
             try:
-                with open(r["md_content_path"], encoding="utf-8") as f:
-                    md_parts.append(f.read())
-            except OSError:
-                pass
+                with open(md_path, encoding="utf-8") as f:
+                    md_slots.append(f.read())
+                md_from_page = True
+            except OSError as exc:
+                errors.append(
+                    ErrorItem(
+                        message=f"markdown for this page could not be read: {exc}",
+                        code="page_degraded",
+                        page_no=page_no,
+                    )
+                )
+                md_slots.append(
+                    _FAILED_PAGE_MD.format(page_no=page_no, code="page_degraded")
+                )
+        else:
+            md_slots.append(None)
 
-        if "json" in to_formats and r.get("layout_info_path"):
+        json_path = r.get("layout_info_path") if "json" in to_formats else None
+        if json_path:
             try:
-                with open(r["layout_info_path"], encoding="utf-8") as f:
-                    json_pages.append(json.load(f))
-            except (OSError, json.JSONDecodeError):
-                json_pages.append(None)
+                with open(json_path, encoding="utf-8") as f:
+                    json_slots.append(json.load(f))
+            except (OSError, json.JSONDecodeError) as exc:
+                errors.append(
+                    ErrorItem(
+                        message=f"layout json for this page could not be read: {exc}",
+                        code="page_degraded",
+                        page_no=page_no,
+                    )
+                )
+                json_slots.append(None)
+        else:
+            json_slots.append(_NO_JSON)
 
-    md_content = "\n\n---\n\n".join(md_parts) if md_parts else None
-    json_content = json_pages if json_pages else None
-    return md_content, json_content
-
-
-def _parse_pdf_with_page_range(
-    parser: "DotsMOCRParser",
-    file_path: str,
-    stem: str,
-    prompt_mode: str,
-    save_dir: str,
-    page_range: Optional[list[int]],
-    image_mode: str = "base64",
-    describe_script: Optional[str] = None,
-) -> list[dict]:
-    from dots_mocr.utils.doc_utils import load_images_from_pdf
-
-    if page_range is None:
-        return parser.parse_pdf(file_path, stem, prompt_mode, save_dir, image_mode=image_mode, describe_script=describe_script)
-
-    start_page, end_page = page_range[0], page_range[1]
-    images = load_images_from_pdf(
-        file_path, dpi=parser.dpi, start_page_id=start_page, end_page_id=end_page
+    # Markers alone are not content: a document where every page failed has no
+    # markdown at all rather than a page of comments.
+    md_content = (
+        "\n\n---\n\n".join(s for s in md_slots if s is not None)
+        if md_from_page
+        else None
     )
-    if not images:
-        return []
-
-    tasks = [
-        {
-            "origin_image": img,
-            "prompt_mode": prompt_mode,
-            "save_dir": save_dir,
-            "save_name": stem,
-            "source": "pdf",
-            "page_idx": start_page + i,
-            "image_mode": image_mode,
-            "describe_script": describe_script,
-        }
-        for i, img in enumerate(images)
-    ]
-
-    results = []
-    with ThreadPool(min(len(tasks), parser.num_thread)) as pool:
-        for result in pool.imap_unordered(
-            lambda t: parser._parse_single_image(**t), tasks
-        ):
-            result["file_path"] = file_path
-            results.append(result)
-    results.sort(key=lambda x: x["page_no"])
-    return results
+    json_content = (
+        [None if s is _NO_JSON else s for s in json_slots]
+        if any(s is not _NO_JSON for s in json_slots)
+        else None
+    )
+    return md_content, json_content, errors, pages_ok
 
 
 _STEM_MAX_BYTES = 100
@@ -191,9 +243,11 @@ def _convert_file_sync(
 
     try:
         if suffix == ".pdf":
-            results = _parse_pdf_with_page_range(
-                parser, file_path, stem, prompt_mode, tmp_out, page_range,
+            results = parser.parse_pdf(
+                file_path, stem, prompt_mode, tmp_out,
                 image_mode=image_mode, describe_script=describe_script,
+                start_page=page_range[0] if page_range else 0,
+                end_page=page_range[1] if page_range else None,
             )
         else:
             results = parser.parse_image(file_path, stem, prompt_mode, tmp_out, image_mode=image_mode, describe_script=describe_script)
@@ -205,7 +259,10 @@ def _convert_file_sync(
                 "in %.2fs",
                 filename, elapsed,
             )
-            errors.append(ErrorItem(message="Parser returned no results (0 renderable pages)"))
+            errors.append(ErrorItem(
+                message="Parser returned no results (0 renderable pages)",
+                code="document_failed",
+            ))
             return ConvertDocumentResponse(
                 document=ExportDocumentResponse(filename=filename),
                 status="failure",
@@ -213,18 +270,31 @@ def _convert_file_sync(
                 processing_time=elapsed,
             )
 
-        md_content, json_content = _assemble_outputs(results, to_formats)
+        md_content, json_content, page_errors, pages_ok = _assemble_outputs(
+            results, to_formats
+        )
+        errors.extend(page_errors)
         text_content = (
             _extract_plain_text(md_content)
             if md_content and "text" in to_formats
             else None
         )
 
+        # A fatal page error degrades the document; the HTTP status is decided
+        # later, by enforce_failure_policy, once every source is done.
+        fatal = [e for e in errors if e.code in FATAL_ERROR_CODES]
+        if not fatal:
+            doc_status = "success"
+        elif pages_ok:
+            doc_status = "partial_success"
+        else:
+            doc_status = "failure"
+
         elapsed = time.monotonic() - start
         logger.info(
-            "convert success: filename=%s pages=%d md_chars=%s json_pages=%s "
-            "in %.2fs",
-            filename, len(results),
+            "convert %s: filename=%s pages=%d ok=%d fatal_errors=%d "
+            "md_chars=%s json_pages=%s in %.2fs",
+            doc_status, filename, len(results), pages_ok, len(fatal),
             len(md_content) if md_content else 0,
             len(json_content) if json_content else 0,
             elapsed,
@@ -236,8 +306,8 @@ def _convert_file_sync(
                 json_content=json_content if "json" in to_formats else None,
                 text_content=text_content,
             ),
-            status="success",
-            errors=[],
+            status=doc_status,
+            errors=errors,
             processing_time=elapsed,
         )
     except Exception as exc:
@@ -246,7 +316,7 @@ def _convert_file_sync(
             "convert error: filename=%s failed after %.2fs: %s",
             filename, elapsed, exc,
         )
-        errors.append(ErrorItem(message=str(exc)))
+        errors.append(ErrorItem(message=str(exc), code="document_failed"))
         return ConvertDocumentResponse(
             document=ExportDocumentResponse(filename=filename),
             status="failure",
@@ -317,6 +387,64 @@ async def _materialise_source(source: FileSourceRequest | HttpSourceRequest) -> 
     return path, filename
 
 
+def _fatal_errors(doc: ConvertDocumentResponse) -> list[ErrorItem]:
+    return [e for e in doc.errors if e.code in FATAL_ERROR_CODES]
+
+
+def _summarise_failure(doc: ConvertDocumentResponse) -> str:
+    fatal = _fatal_errors(doc)
+    if not fatal:
+        return f"status={doc.status}"
+    return f"{len(fatal)} error(s), first: {fatal[0].message}"
+
+
+def enforce_failure_policy(
+    results: list[ConvertDocumentResponse], allow_partial: bool
+) -> None:
+    """Turn failed conversions into a real HTTP error.
+
+    Without ``allow_partial_results`` any document that is not fully successful
+    fails the request; with it, only a request that recognised nothing at all
+    does. Raises 502 when every fatal error came from the model backend, so a
+    client can tell "the model is down" from "we broke"; 500 otherwise.
+    """
+    if not results:
+        return
+
+    if allow_partial:
+        if any(r.status != "failure" for r in results):
+            return
+        offending = results
+        message = f"all {len(results)} document(s) failed"
+    else:
+        offending = [r for r in results if r.status != "success"]
+        if not offending:
+            return
+        message = f"{len(offending)} of {len(results)} document(s) failed"
+
+    message += ": " + "; ".join(
+        f"'{r.document.filename}': {_summarise_failure(r)}" for r in offending
+    )
+    codes = {e.code for r in offending for e in _fatal_errors(r)}
+    status_code = 502 if codes == {"page_model_error"} else 500
+    logger.warning("convert request failed (%d): %s", status_code, message)
+    raise HTTPException(
+        status_code=status_code,
+        detail=ConvertFailureDetail(
+            message=message,
+            documents=[
+                DocumentErrorSummary(
+                    filename=r.document.filename,
+                    status=r.status,
+                    errors=r.errors,
+                    processing_time=r.processing_time,
+                )
+                for r in results
+            ],
+        ).model_dump(),
+    )
+
+
 async def convert_source(
     parser: "DotsMOCRParser",
     request: ConvertDocumentsRequest,
@@ -361,4 +489,5 @@ async def convert_source(
             except OSError:
                 pass
 
+    enforce_failure_policy(results, request.options.allow_partial_results)
     return results

@@ -70,6 +70,12 @@ All settings are via environment variables. None are required — defaults work 
 | `VLLM_MODEL_NAME` | `model` | Model name passed to vLLM |
 | `VLLM_NUM_THREAD` | `64` | Concurrent page inference calls sent to vLLM **per document** |
 | `VLLM_TIMEOUT` | `300` | Per-page inference timeout in seconds. Raise it if large pages queue behind high `VLLM_NUM_THREAD` on a slow GPU |
+| `VLLM_FALLBACK_HOST` | _(unset)_ | When set, enables a fallback vLLM endpoint used when the main one fails (see [Fallback model](#fallback-model)) |
+| `VLLM_FALLBACK_PORT` | `VLLM_PORT` | Fallback vLLM server port |
+| `VLLM_FALLBACK_PROTOCOL` | `VLLM_PROTOCOL` | Fallback `http` or `https` |
+| `VLLM_FALLBACK_MODEL_NAME` | `VLLM_MODEL_NAME` | Model name passed to the fallback server |
+| `VLLM_FALLBACK_API_KEY` | `API_KEY` | API key for the fallback server |
+| `VLLM_FALLBACK_COOLDOWN` | `0` | Seconds to route straight to the fallback after the main model fails; `0` (default) retries the main model on every call |
 | `MOCR_MAX_CONCURRENT` | `2` | Max documents converted concurrently; extra requests queue and wait |
 | `MOCR_API_KEY` | _(unset)_ | When set, enables API key auth on all `/v1` endpoints |
 | `MOCR_OUTPUT_DIR` | `/tmp/mocr_output` | Base directory for temporary output files |
@@ -104,6 +110,25 @@ MOCR_MAX_CONCURRENT=1 VLLM_NUM_THREAD=32 python serve.py --port 8003
 
 For large or bursty batches, prefer the asynchronous `/v1/convert/*/async`
 endpoints (fire-and-forget + polling) over holding a synchronous connection open.
+
+### Fallback model
+
+Set `VLLM_FALLBACK_HOST` to add a second OpenAI-compatible endpoint. It must serve
+dots.mocr or a model with the same prompts and output format, because its answers
+are post-processed the same way.
+
+- The fallback is used only when the main call fails with an upstream error
+  (connection refused, timeout, HTTP error). An empty response is **not** retried.
+- With `VLLM_FALLBACK_COOLDOWN` > 0, once the main model fails, calls go straight to the fallback for
+  `VLLM_FALLBACK_COOLDOWN` seconds, so a stuck backend does not cost a full
+  `VLLM_TIMEOUT` on every page. After that, the main model is tried again.
+- Pages handled by the fallback are still `success`. Each one is flagged with a
+  non-fatal `page_fallback_model` entry in `errors`.
+- If both models fail, the page fails with `page_model_error`, the same as without a fallback.
+
+```bash
+VLLM_HOST=gpu-a VLLM_FALLBACK_HOST=gpu-b VLLM_FALLBACK_PORT=8001 python serve.py --port 8003
+```
 
 ---
 
@@ -218,6 +243,7 @@ Convert documents via multipart file upload.
 **Request** (`multipart/form-data`):
 - `files` — one or more files (`.jpg`, `.jpeg`, `.png`, `.pdf`)
 - `options_json` _(optional)_ — JSON string of `ConvertDocumentsOptions` (default: `{}`)
+- `image_mode`, `to_formats`, `allow_partial_results` _(optional)_ — plain form fields that override the same keys in `options_json`
 
 **curl example:**
 ```bash
@@ -294,6 +320,7 @@ Fetch the result once `task_status` is `success`. Returns the same response shap
 | `prompt_mode` | string | `null` | Override the prompt used. See table below |
 | `image_mode` | string | `"base64"` | How `Picture` cells are rendered in Markdown output. See **Image Handling** below |
 | `describe_script` | string | `null` | Python script used when `image_mode` is `"describe"`. Must live in the repository's `scripts/` directory |
+| `allow_partial_results` | bool | `false` | Return the pages that were recognised instead of failing the request when some pages could not be processed. See **Page Failures** below |
 
 ### Image Handling
 
@@ -355,6 +382,88 @@ curl -s -X POST http://localhost:8003/v1/convert/file \
 
 ---
 
+### Page Failures
+
+Pages are processed independently, so one bad page no longer discards the rest of the
+document. What happens next depends on `allow_partial_results`:
+
+| | `false` (default) | `true` |
+|---|---|---|
+| All pages fine | `200`, `status: "success"` | same |
+| Some pages failed | `500` / `502` | `200`, `status: "partial_success"`, recognised pages returned |
+| No page produced output | `500` / `502` | `500` / `502` |
+| Several sources, any failing | `500` / `502` | `200`, unless nothing at all was recognised |
+
+`502` is returned when *every* fatal error came from the model backend (vLLM
+unreachable, timed out, or answering 5xx) — i.e. the document is probably fine and the
+request is worth retrying. Anything else is `500`.
+
+The error body carries the same per-page structure as a successful response:
+
+```json
+{
+  "detail": {
+    "message": "1 of 2 document(s) failed: 'scan.pdf': 2 error(s), first: Connection error.",
+    "documents": [
+      {
+        "filename": "scan.pdf",
+        "status": "failure",
+        "errors": [
+          {"code": "page_model_error", "page_no": 3, "message": "Connection error."},
+          {"code": "page_skipped", "page_no": 7,
+           "message": "Page contains an oversized embedded image (xref: 12, size: 9000x9000); ..."}
+        ],
+        "processing_time": 12.4
+      }
+    ]
+  }
+}
+```
+
+**Error codes** (`errors[].code`):
+
+| Code | Fatal | Meaning |
+|------|-------|---------|
+| `page_failed` | yes | The page raised during processing |
+| `page_model_error` | yes | The vLLM backend failed for this page (connection, timeout, upstream 5xx) |
+| `page_skipped` | yes | The renderer refused the page (oversized embedded image, empty pixmap) |
+| `page_degraded` | no | Content was recovered, but not cleanly — layout JSON did not parse and text was salvaged by the fallback cleaner, or a page artifact could not be read back |
+| `page_empty_response` | no | The model returned an empty response for this page |
+| `page_fallback_model` | no | The main model was unavailable; this page was processed by the fallback model |
+| `document_failed` | yes | The whole document failed (unreadable file, 0 renderable pages) |
+
+Non-fatal codes are reported in `errors` but never change `status` or the HTTP status —
+they exist so a blank or layout-less page is distinguishable from a genuinely blank one.
+
+With `allow_partial_results: true`, failed pages **keep their slot** so page numbers stay
+usable: `json_content[i]` is `null` for a failed page, and `md_content` carries a marker
+comment between the `---` separators:
+
+```
+...page 0 markdown...
+
+---
+
+<!-- dots.mocr: page 1 failed (page_model_error) -->
+
+---
+
+...page 2 markdown...
+```
+
+`page_no` is the true 0-indexed PDF page number (the same numbering as `page_range`), so
+a skipped page does not shift the pages that follow it. Markers are stripped from
+`text_content`.
+
+```bash
+# get whatever was recognised, even if some pages failed
+curl -X POST http://localhost:8003/v1/convert/file \
+  -F "files=@scan.pdf" \
+  -F "allow_partial_results=true"
+```
+
+---
+
 ### Prompt Modes
 
 | `prompt_mode` | Description |
@@ -391,8 +500,10 @@ list[ConvertDocumentResponse]
        ├─ text_content:    plain text stripped of Markdown (null if not requested)
        ├─ html_content:    always null (not supported)
        └─ doctags_content: always null (not supported)
-     status:          "success" | "failure"
-     errors:          list of {message: string}
+     status:          "success" | "partial_success" | "failure"
+     errors:          list of {message: string,
+                               code: string|null,     # see Page Failures
+                               page_no: int|null}     # 0-indexed PDF page
      processing_time: seconds (float)
 ```
 
@@ -496,11 +607,19 @@ print(results[0]["document"]["md_content"])
 | `400` | Empty upload (0 bytes) or invalid base64 content |
 | `401` | Missing or invalid `X-API-Key` (when auth is enabled) |
 | `422` | Validation error: unsupported file extension, bad `prompt_mode`, malformed `page_range`, invalid `options_json`/`to_formats`, disallowed `describe_script` |
-| `502` | HTTP source download failed |
+| `502` | HTTP source download failed, or every page failed because of the model backend (see **Page Failures**) |
 | `404` | Task ID not found (async endpoints) |
 | `202` | Task result requested but not yet complete |
-| `500` | Async task failed internally |
-| `200` with `"status":"failure"` | Parser error during conversion (docling-serve convention) |
+| `500` | Conversion failed: pages could not be processed and `allow_partial_results` is not set, or an internal error |
+| `200` with `"status":"partial_success"` | Some pages failed and `allow_partial_results` is set |
+
+Failures of a conversion (`500`/`502`) carry a `detail` object with per-document,
+per-page errors — see **Page Failures** for the shape and the code list. The async
+endpoints replay the same status code and body from `GET /v1/result/{task_id}`.
+
+> **Changed behaviour.** Earlier versions answered `200` with `"status":"failure"` for
+> any parser error, and silently dropped pages the renderer refused. Both now produce a
+> `500`/`502` unless `allow_partial_results` is set.
 
 ---
 

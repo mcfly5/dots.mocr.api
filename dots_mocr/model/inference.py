@@ -2,6 +2,7 @@ import os
 import threading
 import time
 
+import openai
 from openai import OpenAI
 
 from dots_mocr.log import logger
@@ -12,20 +13,20 @@ from dots_mocr.utils.image_utils import PILimage_to_base64
 # concurrency slots — for 10 minutes per page.
 _VLLM_TIMEOUT = float(os.environ.get("VLLM_TIMEOUT", "300"))
 
-_clients: dict[str, OpenAI] = {}
+_clients: dict[tuple[str, str], OpenAI] = {}
 _clients_lock = threading.Lock()
 
 
-def _get_client(addr: str) -> OpenAI:
+def _get_client(addr: str, api_key: str) -> OpenAI:
     with _clients_lock:
-        client = _clients.get(addr)
+        client = _clients.get((addr, api_key))
         if client is None:
             client = OpenAI(
-                api_key=os.environ.get("API_KEY", "0"),
+                api_key=api_key,
                 base_url=addr,
                 timeout=_VLLM_TIMEOUT,
             )
-            _clients[addr] = client
+            _clients[(addr, api_key)] = client
         return client
 
 
@@ -40,10 +41,11 @@ def inference_with_vllm(
         max_completion_tokens=32768,
         model_name='rednote-hilab/dots.mocr',
         system_prompt=None,
+        api_key=None,
         ):
 
     addr = f"{protocol}://{ip}:{port}/v1"
-    client = _get_client(addr)
+    client = _get_client(addr, api_key or os.environ.get("API_KEY", "0"))
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -82,3 +84,13 @@ def inference_with_vllm(
     else:
         logger.debug("vllm response: len={} in {:.2f}s", len(content), elapsed)
     return content
+
+
+def is_upstream_error(exc: BaseException) -> bool:
+    """True when the failure is the vLLM backend's, not ours.
+
+    Covers connection refused, read timeouts and upstream HTTP errors — anything
+    the OpenAI SDK raises as ``APIError``. The API layer maps these to 502 rather
+    than 500, so a client can tell "the model is down" from "we broke".
+    """
+    return isinstance(exc, openai.APIError)

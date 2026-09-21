@@ -23,6 +23,10 @@ class TaskRecord:
     finished_at: Optional[float] = None
     result: Optional[Any] = None
     error_message: Optional[str] = None
+    # Preserved so /v1/result can answer with the same status code and body the
+    # sync endpoints would have returned for this failure.
+    error_status: Optional[int] = None
+    error_detail: Optional[Any] = None
 
 
 class TaskManager:
@@ -50,12 +54,20 @@ class TaskManager:
                 rec.result = result
                 rec.finished_at = time.time()
 
-    async def set_failure(self, task_id: str, error: str) -> None:
+    async def set_failure(
+        self,
+        task_id: str,
+        error: str,
+        status_code: Optional[int] = None,
+        detail: Optional[Any] = None,
+    ) -> None:
         async with self._lock:
             if task_id in self._tasks:
                 rec = self._tasks[task_id]
                 rec.status = TaskStatus.FAILURE
                 rec.error_message = error
+                rec.error_status = status_code
+                rec.error_detail = detail
                 rec.finished_at = time.time()
 
     async def get(self, task_id: str) -> Optional[TaskRecord]:

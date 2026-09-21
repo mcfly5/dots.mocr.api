@@ -113,14 +113,23 @@ def fitz_doc_to_image(doc, target_dpi=200, origin_dpi=None) -> dict:
     return image
 
 
-def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -> list:
-    images = []
-    skipped_unsafe = 0
-    skipped_empty = 0
+
+def render_pdf_pages(
+    pdf_file, dpi=200, start_page_id=0, end_page_id=None
+) -> tuple[list[tuple[int, Image.Image]], list[tuple[int, str, str]]]:
+    """Render the selected PDF pages, keeping their true page numbers.
+
+    Returns ``(pages, skipped)`` where ``pages`` is ``[(page_no, image), ...]`` and
+    ``skipped`` is ``[(page_no, code, reason), ...]``. Page numbers are the real
+    0-indexed PDF page numbers, so a skipped page does not shift the ones after it
+    and the API can report "page 7 was skipped because ...".
+    """
+    pages: list[tuple[int, Image.Image]] = []
+    skipped: list[tuple[int, str, str]] = []
     with FITZ_LOCK, fitz.open(pdf_file) as doc:
         pdf_page_num = doc.page_count
         logger.debug(
-            "load_images_from_pdf: file={} page_count={} dpi={} range=[{},{}]",
+            "render_pdf_pages: file={} page_count={} dpi={} range=[{},{}]",
             pdf_file, pdf_page_num, dpi, start_page_id, end_page_id,
         )
         end_page_id = (
@@ -142,20 +151,30 @@ def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -
                         "pdf page {} of {} is not safe to render, skip: {}",
                         index, pdf_file, reason,
                     )
-                    skipped_unsafe += 1
+                    skipped.append((index, "page_skipped", reason))
                     continue
                 img = fitz_doc_to_image(page, target_dpi=dpi)
                 if img is None:
                     logger.warning("pdf page {} of {} is empty, skip", index, pdf_file)
-                    skipped_empty += 1
+                    skipped.append(
+                        (index, "page_skipped", "page rendered to an empty pixmap")
+                    )
                     continue
                 logger.debug(
-                    "load_images_from_pdf: page {} rendered -> {}x{}",
+                    "render_pdf_pages: page {} rendered -> {}x{}",
                     index, img.width, img.height,
                 )
-                images.append(img)
+                pages.append((index, img))
     logger.info(
-        "load_images_from_pdf: file={} rendered={} skipped_unsafe={} skipped_empty={}",
-        pdf_file, len(images), skipped_unsafe, skipped_empty,
+        "render_pdf_pages: file={} rendered={} skipped={}",
+        pdf_file, len(pages), len(skipped),
     )
-    return images
+    return pages, skipped
+
+
+def load_images_from_pdf(pdf_file, dpi=200, start_page_id=0, end_page_id=None) -> list:
+    """Images only, page numbers discarded. Kept for non-API callers."""
+    pages, _ = render_pdf_pages(
+        pdf_file, dpi=dpi, start_page_id=start_page_id, end_page_id=end_page_id
+    )
+    return [img for _, img in pages]

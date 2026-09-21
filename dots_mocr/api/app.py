@@ -46,13 +46,18 @@ _task_manager: Optional[TaskManager] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _parser, _task_manager
+    protocol = os.environ.get("VLLM_PROTOCOL", "http")
+    port = int(os.environ.get("VLLM_PORT", "8000"))
+    model_name = os.environ.get("VLLM_MODEL_NAME", "model")
     _parser = DotsMOCRParser(
-        protocol=os.environ.get("VLLM_PROTOCOL", "http"),
+        protocol=protocol,
         ip=os.environ.get("VLLM_HOST", "localhost"),
-        port=int(os.environ.get("VLLM_PORT", "8000")),
-        model_name=os.environ.get("VLLM_MODEL_NAME", "model"),
+        port=port,
+        model_name=model_name,
         output_dir=os.environ.get("MOCR_OUTPUT_DIR", "/tmp/mocr_output"),
         num_thread=int(os.environ.get("VLLM_NUM_THREAD", "64")),
+        fallback=_fallback_from_env(protocol, port, model_name),
+        fallback_cooldown=float(os.environ.get("VLLM_FALLBACK_COOLDOWN", "0")),
     )
     _task_manager = TaskManager(
         max_age_seconds=int(os.environ.get("MOCR_TASK_TTL", "3600"))
@@ -62,6 +67,20 @@ async def lifespan(app: FastAPI):
     gc_task.cancel()
     _parser = None
     _task_manager = None
+
+
+def _fallback_from_env(protocol: str, port: int, model_name: str) -> Optional[dict]:
+    """Fallback vLLM endpoint config; enabled only when VLLM_FALLBACK_HOST is set."""
+    host = os.environ.get("VLLM_FALLBACK_HOST")
+    if not host:
+        return None
+    return {
+        "protocol": os.environ.get("VLLM_FALLBACK_PROTOCOL", protocol),
+        "ip": host,
+        "port": int(os.environ.get("VLLM_FALLBACK_PORT", str(port))),
+        "model_name": os.environ.get("VLLM_FALLBACK_MODEL_NAME", model_name),
+        "api_key": os.environ.get("VLLM_FALLBACK_API_KEY"),
+    }
 
 
 async def _gc_loop(tm: TaskManager) -> None:
@@ -134,6 +153,7 @@ def _parse_form_options(
     options_json: str,
     image_mode: Optional[str] = None,
     to_formats: Optional[str] = None,
+    allow_partial_results: Optional[bool] = None,
 ) -> ConvertDocumentsOptions:
     try:
         options = ConvertDocumentsOptions.model_validate_json(options_json)
@@ -164,6 +184,8 @@ def _parse_form_options(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Invalid to_formats: {exc}",
             )
+    if allow_partial_results is not None:
+        options.allow_partial_results = allow_partial_results
     return options
 
 
@@ -177,9 +199,12 @@ async def convert_file_sync(
     options_json: str = Form(default="{}"),
     image_mode: Optional[str] = Form(default=None),
     to_formats: Optional[str] = Form(default=None),
+    allow_partial_results: Optional[bool] = Form(default=None),
     parser: DotsMOCRParser = Depends(_get_parser),
 ):
-    options = _parse_form_options(options_json, image_mode, to_formats)
+    options = _parse_form_options(
+        options_json, image_mode, to_formats, allow_partial_results
+    )
     logger.info("convert_file options: %s", options.model_dump())
     sources = await _uploads_to_sources(files)
     request = ConvertDocumentsRequest(sources=sources, options=options)
@@ -268,7 +293,12 @@ async def get_result(
         raise HTTPException(status_code=202, detail="Task not yet complete")
     if record.status == TaskStatus.FAILURE:
         raise HTTPException(
-            status_code=500, detail=record.error_message or "Task failed"
+            status_code=record.error_status or 500,
+            detail=(
+                record.error_detail
+                if record.error_detail is not None
+                else record.error_message or "Task failed"
+            ),
         )
     return record.result
 
@@ -310,6 +340,12 @@ async def _uploads_to_sources(files: list[UploadFile]) -> list[FileSourceRequest
     return sources
 
 
+def _detail_message(detail) -> str:
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail)
+    return str(detail)
+
+
 async def _run_async_task(
     tm: TaskManager,
     parser: DotsMOCRParser,
@@ -321,5 +357,14 @@ async def _run_async_task(
             parser, request, on_start=partial(tm.set_running, task_id)
         )
         await tm.set_success(task_id, result)
+    except HTTPException as exc:
+        # Conversion failures (and download/validation errors) keep their status
+        # code and structured body, so /v1/result answers like the sync route.
+        await tm.set_failure(
+            task_id,
+            _detail_message(exc.detail),
+            status_code=exc.status_code,
+            detail=exc.detail,
+        )
     except Exception as exc:
         await tm.set_failure(task_id, str(exc))

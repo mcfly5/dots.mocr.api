@@ -51,6 +51,9 @@ SourceRequestItem = Annotated[
 
 class ConvertDocumentsOptions(BaseModel):
     do_ocr: bool = True
+    # Return the pages that were recognised instead of failing the request when
+    # some pages could not be processed.
+    allow_partial_results: bool = False
     to_formats: list[str] = ["md", "json"]
     page_range: Optional[list[int]] = None
     prompt_mode: Optional[str] = None

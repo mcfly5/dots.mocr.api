@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import time
 from tqdm import tqdm
 from multiprocessing.pool import ThreadPool, Pool
@@ -8,14 +9,23 @@ from PIL import Image
 
 from dots_mocr.log import logger
 
-from dots_mocr.model.inference import inference_with_vllm
+from dots_mocr.model.inference import inference_with_vllm, is_upstream_error
 from dots_mocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
 from dots_mocr.utils.image_utils import get_image_by_fitz_doc, fetch_image, smart_resize
-from dots_mocr.utils.doc_utils import fitz_doc_to_image, load_images_from_pdf
+from dots_mocr.utils.doc_utils import fitz_doc_to_image, render_pdf_pages
 from dots_mocr.utils.prompts import dict_promptmode_to_prompt
 from dots_mocr.utils.layout_utils import post_process_output, draw_layout_on_image, pre_process_bboxes, parse_scene_text_output, post_process_scene_text, draw_scene_text_on_image, format_scene_text_to_markdown
 from dots_mocr.utils.svg_utils import extract_svg_from_response, svg_to_png, create_comparison_image
 from dots_mocr.utils.format_transformer import layoutjson2md
+
+
+def page_error_result(page_no, exc) -> dict:
+    """A per-page failure as a result entry the API layer turns into an ErrorItem."""
+    code = "page_model_error" if is_upstream_error(exc) else "page_failed"
+    logger.opt(exception=True).error(
+        "page {} failed ({}): {}", page_no, code, exc
+    )
+    return {'page_no': page_no, 'error': {'code': code, 'message': str(exc)}}
 
 
 class DotsMOCRParser:
@@ -37,8 +47,21 @@ class DotsMOCRParser:
             min_pixels=None,
             max_pixels=None,
             use_hf=False,
+            fallback=None,
+            fallback_cooldown=0.0,
         ):
         self.dpi = dpi
+
+        # Optional second vLLM endpoint serving a same-format model, used when
+        # the main one raises an upstream error. Keys: protocol, ip, port,
+        # model_name, api_key. None disables it.
+        self.fallback = fallback
+        # After a main-model failure, send calls straight to the fallback for
+        # this many seconds, so a wedged backend does not cost a full timeout
+        # per page. 0 disables the breaker.
+        self.fallback_cooldown = fallback_cooldown
+        self._main_down_until = 0.0
+        self._breaker_lock = threading.Lock()
 
         # default args for vllm server
         self.protocol = protocol
@@ -60,6 +83,13 @@ class DotsMOCRParser:
             logger.info("use hf model, num_thread will be set to 1")
         else:
             logger.info("use vllm model, num_thread will be set to {}", self.num_thread)
+            if self.fallback:
+                logger.info(
+                    "fallback model configured: {}://{}:{} model={} cooldown={}s",
+                    self.fallback.get("protocol", "http"), self.fallback.get("ip"),
+                    self.fallback.get("port"), self.fallback.get("model_name"),
+                    self.fallback_cooldown,
+                )
         assert self.min_pixels is None or self.min_pixels >= MIN_PIXELS
         assert self.max_pixels is None or self.max_pixels <= MAX_PIXELS
 
@@ -121,22 +151,68 @@ class DotsMOCRParser:
         return response
 
     def _inference_with_vllm(self, image, prompt, prompt_mode, temperature=None):
+        """Run one inference, falling back to the secondary model if configured.
+
+        Returns ``(content, used_fallback)``. Only upstream errors (backend down,
+        timeout, HTTP error) trigger the fallback; anything else propagates.
+        """
         system_prompt = "You are a helpful assistant."
         if prompt_mode != "prompt_general":
             system_prompt = None
-        response = inference_with_vllm(
-            image,
-            prompt,
-            model_name=self.model_name,
-            protocol=self.protocol,
-            ip=self.ip,
-            port=self.port,
+        kwargs = dict(
             temperature=self.temperature if temperature is None else temperature,
             top_p=self.top_p,
             max_completion_tokens=self.max_completion_tokens,
             system_prompt=system_prompt,
         )
-        return response
+
+        def call_main():
+            return inference_with_vllm(
+                image, prompt,
+                model_name=self.model_name,
+                protocol=self.protocol,
+                ip=self.ip,
+                port=self.port,
+                **kwargs,
+            )
+
+        def call_fallback():
+            fb = self.fallback
+            return inference_with_vllm(
+                image, prompt,
+                model_name=fb.get("model_name", self.model_name),
+                protocol=fb.get("protocol", self.protocol),
+                ip=fb["ip"],
+                port=fb.get("port", self.port),
+                api_key=fb.get("api_key"),
+                **kwargs,
+            )
+
+        if not self.fallback:
+            return call_main(), False
+
+        with self._breaker_lock:
+            main_down = time.monotonic() < self._main_down_until
+        if main_down:
+            logger.debug("main model marked down; using fallback model")
+            return call_fallback(), True
+
+        try:
+            return call_main(), False
+        except Exception as main_exc:
+            if not is_upstream_error(main_exc):
+                raise
+            logger.warning(
+                "main model {} failed ({}); retrying on fallback model {}",
+                self.model_name, main_exc, self.fallback.get("model_name", self.model_name),
+            )
+            if self.fallback_cooldown > 0:
+                with self._breaker_lock:
+                    self._main_down_until = time.monotonic() + self.fallback_cooldown
+            try:
+                return call_fallback(), True
+            except Exception as fb_exc:
+                raise fb_exc from main_exc
 
     def get_prompt(self, prompt_mode, bbox=None, origin_image=None, image=None, min_pixels=None, max_pixels=None, custom_prompt=None):
         prompt = dict_promptmode_to_prompt[prompt_mode]
@@ -193,7 +269,7 @@ class DotsMOCRParser:
                 if self.use_hf:
                     response = self._inference_with_hf(crop, prompt)
                 else:
-                    response = self._inference_with_vllm(crop, prompt, "prompt_ocr")
+                    response, _ = self._inference_with_vllm(crop, prompt, "prompt_ocr")
                 cell['text'] = (response or "").strip()
             except Exception as e:
                 logger.warning("picture OCR failed for bbox {}: {}", cell.get('bbox'), e)
@@ -236,10 +312,11 @@ class DotsMOCRParser:
             input_width, input_height, min_pixels, max_pixels, prompt_mode, len(prompt),
         )
 
+        used_fallback = False
         if self.use_hf:
             response = self._inference_with_hf(image, prompt)
         else:
-            response = self._inference_with_vllm(image, prompt, prompt_mode, temperature=temperature)
+            response, used_fallback = self._inference_with_vllm(image, prompt, prompt_mode, temperature=temperature)
         if not response:
             logger.warning(
                 "inference returned empty response: source={} page_idx={} prompt_mode={}",
@@ -254,6 +331,12 @@ class DotsMOCRParser:
             "input_height": input_height,
             "input_width": input_width
         }
+        if not response:
+            # Not an error: the page still yields (empty) output. Surfaced as a
+            # diagnostic so a blank result is distinguishable from a blank page.
+            result['empty_response'] = True
+        if used_fallback:
+            result['fallback_model'] = self.fallback.get("model_name", self.model_name)
         if source == 'pdf':
             save_name = f"{save_name}_page_{page_idx}"
         if prompt_mode in ['prompt_layout_all_en', 'prompt_layout_only_en', 'prompt_grounding_ocr', 'prompt_web_parsing']:
@@ -418,16 +501,21 @@ class DotsMOCRParser:
         return result
     
     def parse_image(self, input_path, filename, prompt_mode, save_dir, bbox=None, fitz_preprocess=False, custom_prompt=None, temperature=None, image_mode="base64", describe_script=None):
-        origin_image = fetch_image(input_path)
-        result = self._parse_single_image(origin_image, prompt_mode, save_dir, filename, source="image", bbox=bbox, fitz_preprocess=fitz_preprocess, custom_prompt=custom_prompt, temperature=temperature, image_mode=image_mode, describe_script=describe_script)
+        try:
+            origin_image = fetch_image(input_path)
+            result = self._parse_single_image(origin_image, prompt_mode, save_dir, filename, source="image", bbox=bbox, fitz_preprocess=fitz_preprocess, custom_prompt=custom_prompt, temperature=temperature, image_mode=image_mode, describe_script=describe_script)
+        except Exception as exc:
+            result = page_error_result(0, exc)
         result['file_path'] = input_path
         return [result]
         
-    def parse_pdf(self, input_path, filename, prompt_mode, save_dir, image_mode="base64", describe_script=None):
+    def parse_pdf(self, input_path, filename, prompt_mode, save_dir, image_mode="base64", describe_script=None, start_page=0, end_page=None):
         logger.info("loading pdf: {} (prompt_mode={})", input_path, prompt_mode)
-        images_origin = load_images_from_pdf(input_path, dpi=self.dpi)
-        total_pages = len(images_origin)
-        if total_pages == 0:
+        pages, skipped = render_pdf_pages(
+            input_path, dpi=self.dpi, start_page_id=start_page, end_page_id=end_page
+        )
+        total_pages = len(pages)
+        if total_pages == 0 and not skipped:
             logger.warning("No renderable pages found in {}", input_path)
             return []
         tasks = [
@@ -437,40 +525,58 @@ class DotsMOCRParser:
                 "save_dir": save_dir,
                 "save_name": filename,
                 "source": "pdf",
-                "page_idx": i,
+                "page_idx": page_no,
                 "image_mode": image_mode,
                 "describe_script": describe_script,
-            } for i, image in enumerate(images_origin)
+            } for page_no, image in pages
         ]
 
         def _execute_task(task_args):
-            return self._parse_single_image(**task_args)
+            # One bad page must not abort the pool and discard the pages that
+            # already succeeded, so the failure travels back as a result entry.
+            try:
+                return self._parse_single_image(**task_args)
+            except Exception as exc:
+                return page_error_result(task_args["page_idx"], exc)
 
         if self.use_hf:
             num_thread =  1
         else:
-            num_thread = min(total_pages, self.num_thread)
+            num_thread = min(total_pages, self.num_thread) if total_pages else 1
         logger.info(
             "Parsing PDF {} with {} pages using {} threads...",
             input_path, total_pages, num_thread,
         )
 
         start = time.monotonic()
-        results = []
-        with ThreadPool(num_thread) as pool:
-            with tqdm(total=total_pages, desc="Processing PDF pages") as pbar:
-                for result in pool.imap_unordered(_execute_task, tasks):
-                    logger.debug(
-                        "page done: page_no={} has_md={} filtered={}",
-                        result.get("page_no"),
-                        bool(result.get("md_content_path")),
-                        result.get("filtered", False),
-                    )
-                    results.append(result)
-                    pbar.update(1)
+        # Pages the renderer refused are reported too, at their real page number.
+        results = [
+            {'page_no': page_no, 'error': {'code': code, 'message': reason}}
+            for page_no, code, reason in skipped
+        ]
+        if tasks:
+            with ThreadPool(num_thread) as pool:
+                with tqdm(total=total_pages, desc="Processing PDF pages") as pbar:
+                    for result in pool.imap_unordered(_execute_task, tasks):
+                        if result.get("error"):
+                            logger.debug(
+                                "page failed: page_no={} code={}",
+                                result.get("page_no"), result["error"].get("code"),
+                            )
+                        else:
+                            logger.debug(
+                                "page done: page_no={} has_md={} filtered={}",
+                                result.get("page_no"),
+                                bool(result.get("md_content_path")),
+                                result.get("filtered", False),
+                            )
+                        results.append(result)
+                        pbar.update(1)
+        failed = sum(1 for r in results if r.get("error"))
         logger.info(
-            "Parsed PDF {}: {}/{} pages in {:.2f}s",
-            input_path, len(results), total_pages, time.monotonic() - start,
+            "Parsed PDF {}: {}/{} pages ok, {} failed, in {:.2f}s",
+            input_path, len(results) - failed, len(results), failed,
+            time.monotonic() - start,
         )
 
         results.sort(key=lambda x: x["page_no"])
