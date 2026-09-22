@@ -74,6 +74,9 @@ def _fallback_from_env(protocol: str, port: int, model_name: str) -> Optional[di
     host = os.environ.get("VLLM_FALLBACK_HOST")
     if not host:
         return None
+    prompts = os.environ.get("VLLM_FALLBACK_PROMPTS", "dots")
+    if prompts not in ("dots", "generic"):
+        raise ValueError(f"VLLM_FALLBACK_PROMPTS must be 'dots' or 'generic', got {prompts!r}")
     return {
         "protocol": os.environ.get("VLLM_FALLBACK_PROTOCOL", protocol),
         "ip": host,
@@ -85,6 +88,9 @@ def _fallback_from_env(protocol: str, port: int, model_name: str) -> Optional[di
         # Range of the fallback's relative bbox coordinates (1000 for Qwen3-VL
         # style models); 0 means pixels of the input image, as dots.mocr emits.
         "bbox_scale": float(os.environ.get("VLLM_FALLBACK_BBOX_SCALE", "0")),
+        # "dots": same prompts as the main model; "generic": prompts written for
+        # a general-purpose VLM (see dict_promptmode_to_fallback_prompt).
+        "prompts": prompts,
     }
 
 

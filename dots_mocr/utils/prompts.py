@@ -44,3 +44,39 @@ dict_promptmode_to_prompt = {
     # "prompt_table_latex": """Convert the table in this image to LaTeX.""",
     # "prompt_formula_latex": """Convert the formula in this image to LaTeX.""",
 }
+
+
+# Prompts for a general-purpose VLM serving as the fallback model (e.g. Qwen-VL),
+# which does not know dots.mocr's prompt conventions. Answers must still
+# post-process like dots output: normalize_layout_response() maps bbox_2d to
+# bbox and strips code fences, and VLLM_FALLBACK_BBOX_SCALE handles relative
+# coordinates. Modes missing here send the fallback the dots prompt.
+_LAYOUT_CATEGORIES = "Caption, Footnote, Formula, List-item, Page-footer, Page-header, Picture, Section-header, Table, Text, Title"
+
+dict_promptmode_to_fallback_prompt = {
+    "prompt_layout_all_en": f"""Detect every layout element in this document image and read its text.
+
+Output a JSON array with one object per element, in human reading order:
+[{{"bbox_2d": [x1, y1, x2, y2], "category": "...", "text": "..."}}, ...]
+
+- category: exactly one of {_LAYOUT_CATEGORIES}.
+- text: the original text of the element, not translated.
+  - Table: format as HTML (<table>...</table>).
+  - Formula: format as LaTeX.
+  - Picture: omit the "text" key.
+  - Everything else: format as Markdown.
+- Output only the JSON array, with no explanation.
+""",
+
+    "prompt_layout_only_en": f"""Detect every layout element in this document image.
+
+Output a JSON array with one object per element, in human reading order:
+[{{"bbox_2d": [x1, y1, x2, y2], "category": "..."}}, ...]
+
+- category: exactly one of {_LAYOUT_CATEGORIES}.
+- Do not output the text of the elements.
+- Output only the JSON array, with no explanation.
+""",
+
+    "prompt_ocr": """Extract all text from this image in reading order, without translating it. Format tables as HTML, formulas as LaTeX and everything else as Markdown. Output only the extracted text, with no explanation.""",
+}

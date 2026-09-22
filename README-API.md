@@ -77,6 +77,7 @@ All settings are via environment variables. None are required — defaults work 
 | `VLLM_FALLBACK_API_KEY` | `API_KEY` | API key for the fallback server |
 | `VLLM_FALLBACK_COOLDOWN` | `0` | Seconds to route straight to the fallback after the main model becomes unreachable; `0` (default) retries the main model on every call |
 | `VLLM_FALLBACK_STRIP_THINKING` | `1` | Strip `<think>…</think>` reasoning from the fallback's answers; set `0` to keep them verbatim |
+| `VLLM_FALLBACK_PROMPTS` | `dots` | Prompts sent to the fallback: `dots` = the main model's prompts; `generic` = prompts written for a general-purpose VLM (layout and OCR modes) |
 | `VLLM_FALLBACK_BBOX_SCALE` | `0` | Coordinate range of the fallback's layout boxes: `0` = pixels of the input image (dots.mocr, Qwen2.5-VL), `1000` = relative 0–1000 (Qwen3-VL / Qwen3.5) |
 | `MOCR_MAX_CONCURRENT` | `2` | Max documents converted concurrently; extra requests queue and wait |
 | `MOCR_API_KEY` | _(unset)_ | When set, enables API key auth on all `/v1` endpoints |
@@ -122,6 +123,16 @@ a ```` ```json ```` fence around the answer and Qwen grounding keys (`bbox_2d`,
 `text_content`) are accepted, and a missing `category` defaults to `Text`, so such
 pages get text but no headings, tables or formulas. For Qwen3-VL / Qwen3.5, set
 `VLLM_FALLBACK_BBOX_SCALE=1000`, because they emit relative 0–1000 boxes.
+
+For such a model, also set `VLLM_FALLBACK_PROMPTS=generic`. It then gets its own
+layout and OCR prompts, which ask for a category and for tables as HTML and
+formulas as LaTeX, so its pages keep their structure. Grounding, SVG and custom
+prompts are sent unchanged.
+
+```bash
+VLLM_FALLBACK_HOST=gpu-b VLLM_FALLBACK_MODEL_NAME=Qwen3.5-4B \
+VLLM_FALLBACK_PROMPTS=generic VLLM_FALLBACK_BBOX_SCALE=1000 python serve.py
+```
 
 - The fallback is used only when the main call fails with an upstream error
   (connection refused, timeout, 5xx, 429). A 4xx (e.g. prompt or image too long)

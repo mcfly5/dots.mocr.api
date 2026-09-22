@@ -6,6 +6,7 @@ from PIL import Image
 
 from dots_mocr import parser as parser_mod
 from dots_mocr.parser import DotsMOCRParser
+from dots_mocr.utils.prompts import dict_promptmode_to_fallback_prompt, dict_promptmode_to_prompt
 from tests.conftest import api_status_error, connection_error
 
 
@@ -15,9 +16,11 @@ class _Backend:
     def __init__(self):
         self.behaviour = {"main": "main-answer", "fb": "fb-answer"}
         self.calls = []
+        self.prompts = []
 
     def __call__(self, image, prompt, *, ip, **kwargs):
         self.calls.append((ip, kwargs.get("strip_reasoning", False)))
+        self.prompts.append((ip, prompt))
         outcome = self.behaviour[ip]
         if isinstance(outcome, BaseException):
             raise outcome
@@ -157,3 +160,30 @@ def test_qwen_style_fallback_answer_parses_and_scales(backend, tmp_path):
         assert "Appendix D" in f.read()
     with open(result["layout_info_path"], encoding="utf-8") as f:
         assert json.load(f)[0]["bbox"] == [0, 0, 322, 462]
+
+
+LAYOUT = "prompt_layout_all_en"
+
+
+def test_fallback_gets_dots_prompt_by_default(backend):
+    backend.behaviour["main"] = connection_error()
+    _parser()._inference_with_vllm(None, dict_promptmode_to_prompt[LAYOUT], LAYOUT)
+    assert backend.prompts[-1] == ("fb", dict_promptmode_to_prompt[LAYOUT])
+
+
+def test_generic_prompts_only_for_fallback(backend):
+    backend.behaviour["main"] = connection_error()
+    _parser(prompts="generic")._inference_with_vllm(None, dict_promptmode_to_prompt[LAYOUT], LAYOUT)
+    assert backend.prompts == [
+        ("main", dict_promptmode_to_prompt[LAYOUT]),
+        ("fb", dict_promptmode_to_fallback_prompt[LAYOUT]),
+    ]
+
+
+def test_generic_prompts_keep_non_stock_prompt(backend):
+    backend.behaviour["main"] = connection_error()
+    p = _parser(prompts="generic")
+    grounding = dict_promptmode_to_prompt["prompt_grounding_ocr"] + "[1, 2, 3, 4]"
+    p._inference_with_vllm(None, grounding, "prompt_grounding_ocr")
+    p._inference_with_vllm(None, "custom", LAYOUT)
+    assert [pr for ip, pr in backend.prompts if ip == "fb"] == [grounding, "custom"]

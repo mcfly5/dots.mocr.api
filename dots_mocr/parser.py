@@ -13,7 +13,7 @@ from dots_mocr.model.inference import ModelOutputError, inference_with_vllm, is_
 from dots_mocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
 from dots_mocr.utils.image_utils import get_image_by_fitz_doc, fetch_image, smart_resize
 from dots_mocr.utils.doc_utils import fitz_doc_to_image, render_pdf_pages
-from dots_mocr.utils.prompts import dict_promptmode_to_prompt
+from dots_mocr.utils.prompts import dict_promptmode_to_fallback_prompt, dict_promptmode_to_prompt
 from dots_mocr.utils.layout_utils import post_process_output, draw_layout_on_image, pre_process_bboxes, parse_scene_text_output, post_process_scene_text, draw_scene_text_on_image, format_scene_text_to_markdown
 from dots_mocr.utils.svg_utils import extract_svg_from_response, svg_to_png, create_comparison_image
 from dots_mocr.utils.format_transformer import layoutjson2md
@@ -180,7 +180,7 @@ class DotsMOCRParser:
         def call_fallback():
             fb = self.fallback
             return inference_with_vllm(
-                image, prompt,
+                image, self._fallback_prompt(prompt, prompt_mode),
                 model_name=fb.get("model_name", self.model_name),
                 protocol=fb.get("protocol", self.protocol),
                 ip=fb["ip"],
@@ -232,6 +232,20 @@ class DotsMOCRParser:
                 return call_fallback(), True
             except Exception as fb_exc:
                 raise fb_exc from main_exc
+
+    def _fallback_prompt(self, prompt, prompt_mode):
+        """The prompt to send the fallback model in place of ``prompt``.
+
+        With ``prompts: "generic"`` the fallback gets its own prompt for the
+        modes that have one, but only when ``prompt`` is that mode's stock dots
+        prompt: a grounding bbox, SVG size or custom prompt is kept as is.
+        """
+        if self.fallback.get("prompts") != "generic":
+            return prompt
+        own = dict_promptmode_to_fallback_prompt.get(prompt_mode)
+        if own is None or prompt != dict_promptmode_to_prompt.get(prompt_mode):
+            return prompt
+        return own
 
     def get_prompt(self, prompt_mode, bbox=None, origin_image=None, image=None, min_pixels=None, max_pixels=None, custom_prompt=None):
         prompt = dict_promptmode_to_prompt[prompt_mode]
