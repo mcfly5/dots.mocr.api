@@ -3,6 +3,7 @@ from typing import Dict, List
 
 import fitz
 from io import BytesIO
+import html
 import json
 import re
 
@@ -230,8 +231,37 @@ def normalize_layout_response(text):
     return text
 
 
+_MD_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+
+
+def markdown_table_to_html(text):
+    """Convert a Markdown pipe table to the HTML dots.mocr emits for tables.
+
+    Returns None unless ``text`` is exactly one pipe table (header row,
+    separator row, body rows), so anything else is left alone.
+    """
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if len(lines) < 2 or not _MD_TABLE_SEP.match(lines[1]) or not all("|" in line for line in lines):
+        return None
+
+    def cells_of(line):
+        line = line.strip()
+        if line.startswith("|"):
+            line = line[1:]
+        if line.endswith("|"):
+            line = line[:-1]
+        return [html.escape(c.strip(), quote=False) for c in line.split("|")]
+
+    rows = [lines[0]] + lines[2:]
+    return "<table>" + "".join(
+        "<tr>" + "".join(f"<td>{c}</td>" for c in cells_of(row)) + "</tr>" for row in rows
+    ) + "</table>"
+
+
 def _normalize_cells(cells, input_width, input_height, bbox_scale=None):
     """Fill in what a non-dots model leaves out: category, and pixel coordinates.
+
+    A Table given as a Markdown pipe table is converted to HTML, as dots emits.
 
     ``bbox_scale`` is the coordinate range of relative boxes (1000 for
     Qwen3-VL-style models); falsy means boxes are already in pixels of the
@@ -241,6 +271,10 @@ def _normalize_cells(cells, input_width, input_height, bbox_scale=None):
         if not isinstance(cell, dict):
             continue
         cell.setdefault('category', 'Text')
+        if cell['category'] == 'Table' and isinstance(cell.get('text'), str):
+            table_html = markdown_table_to_html(cell['text'])
+            if table_html:
+                cell['text'] = table_html
         if bbox_scale and isinstance(cell.get('bbox'), list) and len(cell['bbox']) == 4:
             x0, y0, x1, y1 = (float(v) for v in cell['bbox'])
             cell['bbox'] = [

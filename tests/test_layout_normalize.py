@@ -1,7 +1,9 @@
+import json
+
 import pytest
 from PIL import Image
 
-from dots_mocr.utils.layout_utils import normalize_layout_response, post_process_output
+from dots_mocr.utils.layout_utils import markdown_table_to_html, normalize_layout_response, post_process_output
 
 # Shape of a Qwen3.5 fallback answer to prompt_layout_all_en.
 QWEN_ANSWER = (
@@ -56,3 +58,24 @@ def test_truncated_qwen_answer_salvages_text(images):
     text, filtered = post_process_output(truncated, "prompt_layout_all_en", *images)
     assert filtered
     assert "Appendix D" in text
+
+
+def test_markdown_table_converted_to_html(images):
+    answer = json.dumps([{
+        "bbox_2d": [0, 0, 100, 100], "category": "Table",
+        "text": "| Sample | Fat, % |\n|---|:--:|\n| A | 3.2 |\n| B<1 | 2.5 |",
+    }])
+    cells, _ = post_process_output(answer, "prompt_layout_all_en", *images)
+    assert cells[0]["text"] == (
+        "<table><tr><td>Sample</td><td>Fat, %</td></tr>"
+        "<tr><td>A</td><td>3.2</td></tr><tr><td>B&lt;1</td><td>2.5</td></tr></table>"
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "<table><tr><td>A</td></tr></table>",  # already HTML
+    "Sample  Fat\nA  3.2",                   # plain text: no reliable columns
+    "a | b",                                 # a pipe, but no separator row
+])
+def test_non_markdown_table_left_alone(text):
+    assert markdown_table_to_html(text) is None

@@ -56,16 +56,23 @@ _LAYOUT_CATEGORIES = "Caption, Footnote, Formula, List-item, Page-footer, Page-h
 dict_promptmode_to_fallback_prompt = {
     "prompt_layout_all_en": f"""Detect every layout element in this document image and read its text.
 
-Output a JSON array with one object per element, in human reading order:
-[{{"bbox_2d": [x1, y1, x2, y2], "category": "...", "text": "..."}}, ...]
+Output a JSON array with one object per element, in human reading order.
 
 - category: exactly one of {_LAYOUT_CATEGORIES}.
 - text: the original text of the element, not translated.
-  - Table: format as HTML (<table>...</table>).
-  - Formula: format as LaTeX.
+  - Table: always an HTML <table>, one <tr> per row and one <td> per cell. Never a Markdown table or plain text.
+  - Formula: LaTeX.
   - Picture: omit the "text" key.
-  - Everything else: format as Markdown.
+  - Everything else: Markdown.
 - Output only the JSON array, with no explanation.
+
+Example:
+[
+  {{"bbox_2d": [80, 40, 520, 70], "category": "Section-header", "text": "## Results"}},
+  {{"bbox_2d": [80, 80, 900, 130], "category": "Text", "text": "Samples were measured twice."}},
+  {{"bbox_2d": [80, 140, 900, 260], "category": "Table", "text": "<table><tr><td>Sample</td><td>Fat, %</td></tr><tr><td>A</td><td>3.2</td></tr><tr><td>B</td><td>2.5</td></tr></table>"}},
+  {{"bbox_2d": [80, 270, 600, 300], "category": "Formula", "text": "\\\\bar{{x}} = \\\\frac{{1}}{{n}}\\\\sum_{{i=1}}^{{n}} x_i"}}
+]
 """,
 
     "prompt_layout_only_en": f"""Detect every layout element in this document image.
@@ -78,5 +85,5 @@ Output a JSON array with one object per element, in human reading order:
 - Output only the JSON array, with no explanation.
 """,
 
-    "prompt_ocr": """Extract all text from this image in reading order, without translating it. Format tables as HTML, formulas as LaTeX and everything else as Markdown. Output only the extracted text, with no explanation.""",
+    "prompt_ocr": """Extract all text from this image in reading order, without translating it. Format tables as HTML <table> (never Markdown tables or plain text), formulas as LaTeX and everything else as Markdown. Output only the extracted text, with no explanation.""",
 }
