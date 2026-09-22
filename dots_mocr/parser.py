@@ -9,7 +9,7 @@ from PIL import Image
 
 from dots_mocr.log import logger
 
-from dots_mocr.model.inference import inference_with_vllm, is_upstream_error
+from dots_mocr.model.inference import inference_with_vllm, is_backend_down, is_upstream_error
 from dots_mocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
 from dots_mocr.utils.image_utils import get_image_by_fitz_doc, fetch_image, smart_resize
 from dots_mocr.utils.doc_utils import fitz_doc_to_image, render_pdf_pages
@@ -154,7 +154,8 @@ class DotsMOCRParser:
         """Run one inference, falling back to the secondary model if configured.
 
         Returns ``(content, used_fallback)``. Only upstream errors (backend down,
-        timeout, HTTP error) trigger the fallback; anything else propagates.
+        timeout, 5xx, 429) trigger the fallback; anything else propagates. Only
+        an unreachable backend arms the cooldown breaker.
         """
         system_prompt = "You are a helpful assistant."
         if prompt_mode != "prompt_general":
@@ -185,6 +186,7 @@ class DotsMOCRParser:
                 ip=fb["ip"],
                 port=fb.get("port", self.port),
                 api_key=fb.get("api_key"),
+                strip_reasoning=fb.get("strip_thinking", True),
                 **kwargs,
             )
 
@@ -195,7 +197,24 @@ class DotsMOCRParser:
             main_down = time.monotonic() < self._main_down_until
         if main_down:
             logger.debug("main model marked down; using fallback model")
-            return call_fallback(), True
+            try:
+                return call_fallback(), True
+            except Exception as fb_exc:
+                if not is_upstream_error(fb_exc):
+                    raise
+                # Both may not be down: main could have recovered before the
+                # cooldown ran out, so probe it rather than fail the page.
+                logger.warning(
+                    "fallback model failed during main cooldown ({}); probing main", fb_exc
+                )
+                try:
+                    content = call_main()
+                except Exception as main_exc:
+                    raise main_exc from fb_exc
+                with self._breaker_lock:
+                    self._main_down_until = 0.0
+                logger.info("main model {} is back; breaker closed", self.model_name)
+                return content, False
 
         try:
             return call_main(), False
@@ -206,7 +225,7 @@ class DotsMOCRParser:
                 "main model {} failed ({}); retrying on fallback model {}",
                 self.model_name, main_exc, self.fallback.get("model_name", self.model_name),
             )
-            if self.fallback_cooldown > 0:
+            if self.fallback_cooldown > 0 and is_backend_down(main_exc):
                 with self._breaker_lock:
                     self._main_down_until = time.monotonic() + self.fallback_cooldown
             try:
@@ -244,9 +263,12 @@ class DotsMOCRParser:
 
         Never raises: a bad bbox or a failed inference logs a warning and leaves
         the cell's text empty, so one picture cannot fail the whole page.
+
+        Returns True when any crop was served by the fallback model.
         """
         prompt = dict_promptmode_to_prompt["prompt_ocr"]
         width, height = origin_image.width, origin_image.height
+        used_fallback = False
 
         for cell in cells:
             if cell.get('category') != 'Picture':
@@ -269,10 +291,12 @@ class DotsMOCRParser:
                 if self.use_hf:
                     response = self._inference_with_hf(crop, prompt)
                 else:
-                    response, _ = self._inference_with_vllm(crop, prompt, "prompt_ocr")
+                    response, crop_fallback = self._inference_with_vllm(crop, prompt, "prompt_ocr")
+                    used_fallback = used_fallback or crop_fallback
                 cell['text'] = (response or "").strip()
             except Exception as e:
                 logger.warning("picture OCR failed for bbox {}: {}", cell.get('bbox'), e)
+        return used_fallback
 
     # def post_process_results(self, response, prompt_mode, save_dir, save_name, origin_image, image, min_pixels, max_pixels)
     def _parse_single_image(
@@ -335,8 +359,6 @@ class DotsMOCRParser:
             # Not an error: the page still yields (empty) output. Surfaced as a
             # diagnostic so a blank result is distinguishable from a blank page.
             result['empty_response'] = True
-        if used_fallback:
-            result['fallback_model'] = self.fallback.get("model_name", self.model_name)
         if source == 'pdf':
             save_name = f"{save_name}_page_{page_idx}"
         if prompt_mode in ['prompt_layout_all_en', 'prompt_layout_only_en', 'prompt_grounding_ocr', 'prompt_web_parsing']:
@@ -383,7 +405,7 @@ class DotsMOCRParser:
                 # text reaches every output format and costs one call per
                 # picture rather than two.
                 if image_mode == "ocr" and prompt_mode != "prompt_layout_only_en":
-                    self._ocr_picture_cells(origin_image, cells)
+                    used_fallback = self._ocr_picture_cells(origin_image, cells) or used_fallback
 
                 try:
                     image_with_layout = draw_layout_on_image(origin_image, cells)
@@ -498,11 +520,16 @@ class DotsMOCRParser:
                 'md_content_path': md_file_path,
             })
 
+        # Set last: picture OCR in the layout branch may also use the fallback.
+        if used_fallback:
+            result['fallback_model'] = self.fallback.get("model_name", self.model_name)
         return result
     
     def parse_image(self, input_path, filename, prompt_mode, save_dir, bbox=None, fitz_preprocess=False, custom_prompt=None, temperature=None, image_mode="base64", describe_script=None):
+        # Outside the try: an undecodable upload is the client's error, and the
+        # API layer reports it as document_invalid rather than a failed page.
+        origin_image = fetch_image(input_path)
         try:
-            origin_image = fetch_image(input_path)
             result = self._parse_single_image(origin_image, prompt_mode, save_dir, filename, source="image", bbox=bbox, fitz_preprocess=fitz_preprocess, custom_prompt=custom_prompt, temperature=temperature, image_mode=image_mode, describe_script=describe_script)
         except Exception as exc:
             result = page_error_result(0, exc)

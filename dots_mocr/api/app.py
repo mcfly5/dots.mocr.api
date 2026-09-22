@@ -80,6 +80,8 @@ def _fallback_from_env(protocol: str, port: int, model_name: str) -> Optional[di
         "port": int(os.environ.get("VLLM_FALLBACK_PORT", str(port))),
         "model_name": os.environ.get("VLLM_FALLBACK_MODEL_NAME", model_name),
         "api_key": os.environ.get("VLLM_FALLBACK_API_KEY"),
+        # Strip <think> reasoning from the fallback's answers (thinking models).
+        "strip_thinking": os.environ.get("VLLM_FALLBACK_STRIP_THINKING", "1") != "0",
     }
 
 

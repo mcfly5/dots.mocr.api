@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
+import fitz
 import httpx
 from fastapi import HTTPException
+from PIL import Image, UnidentifiedImageError
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -76,6 +78,11 @@ def _extract_plain_text(md: str) -> str:
 
 
 _FAILED_PAGE_MD = "<!-- dots.mocr: page {page_no} failed ({code}) -->"
+
+# The upload itself cannot be decoded: a client error (422), not ours (500).
+_INVALID_INPUT_ERRORS = (
+    UnidentifiedImageError, Image.DecompressionBombError, fitz.FileDataError,
+)
 
 # Distinguishes "this page has no json at all" (e.g. an SVG prompt mode) from
 # "this page's json is missing because it failed", which is serialised as null.
@@ -146,7 +153,9 @@ def _assemble_outputs(
                 )
             )
 
-        md_path = r.get("md_content_path") if "md" in to_formats else None
+        # text is derived from the markdown, so read it for either format.
+        wants_md = "md" in to_formats or "text" in to_formats
+        md_path = r.get("md_content_path") if wants_md else None
         if md_path:
             try:
                 with open(md_path, encoding="utf-8") as f:
@@ -316,7 +325,12 @@ def _convert_file_sync(
             "convert error: filename=%s failed after %.2fs: %s",
             filename, elapsed, exc,
         )
-        errors.append(ErrorItem(message=str(exc), code="document_failed"))
+        code = (
+            "document_invalid"
+            if isinstance(exc, _INVALID_INPUT_ERRORS)
+            else "document_failed"
+        )
+        errors.append(ErrorItem(message=str(exc), code=code))
         return ConvertDocumentResponse(
             document=ExportDocumentResponse(filename=filename),
             status="failure",
@@ -405,8 +419,9 @@ def enforce_failure_policy(
 
     Without ``allow_partial_results`` any document that is not fully successful
     fails the request; with it, only a request that recognised nothing at all
-    does. Raises 502 when every fatal error came from the model backend, so a
-    client can tell "the model is down" from "we broke"; 500 otherwise.
+    does. Raises 422 when every fatal error is an undecodable upload, 502 when
+    every one came from the model backend (so a client can tell "the model is
+    down" from "we broke"), and 500 otherwise.
     """
     if not results:
         return
@@ -426,7 +441,12 @@ def enforce_failure_policy(
         f"'{r.document.filename}': {_summarise_failure(r)}" for r in offending
     )
     codes = {e.code for r in offending for e in _fatal_errors(r)}
-    status_code = 502 if codes == {"page_model_error"} else 500
+    if codes == {"document_invalid"}:
+        status_code = 422
+    elif codes == {"page_model_error"}:
+        status_code = 502
+    else:
+        status_code = 500
     logger.warning("convert request failed (%d): %s", status_code, message)
     raise HTTPException(
         status_code=status_code,

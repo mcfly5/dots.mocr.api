@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import time
 
@@ -12,6 +13,40 @@ from dots_mocr.utils.image_utils import PILimage_to_base64
 # default (600s) lets a wedged vLLM pin ThreadPool threads — and the API's
 # concurrency slots — for 10 minutes per page.
 _VLLM_TIMEOUT = float(os.environ.get("VLLM_TIMEOUT", "300"))
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
+_THINK_OPEN = re.compile(r"<think>", re.IGNORECASE)
+
+
+def strip_thinking(text):
+    """Remove reasoning a thinking model (e.g. the fallback) put into its answer.
+
+    Handles full ``<think>…</think>`` blocks, an orphan ``</think>`` (the chat
+    template injected the opening tag) and an unclosed ``<think>`` (generation
+    cut off mid-thought, leaving no answer). Text without tags is returned as is.
+    """
+    if not text:
+        return text
+    if not (_THINK_OPEN.search(text) or _THINK_CLOSE.search(text)):
+        return text
+    text = _THINK_BLOCK.sub("", text)
+    closes = list(_THINK_CLOSE.finditer(text))
+    if closes:
+        text = text[closes[-1].end():]
+    opened = _THINK_OPEN.search(text)
+    if opened:
+        text = text[:opened.start()]
+    return text.strip()
+
+
+class ModelOutputError(RuntimeError):
+    """The model answered, but with nothing usable (e.g. reasoning only).
+
+    Not an ``openai.APIError``: the backend is fine, so there is no fallback
+    retry and the page is reported as ``page_failed``.
+    """
+
 
 _clients: dict[tuple[str, str], OpenAI] = {}
 _clients_lock = threading.Lock()
@@ -42,6 +77,7 @@ def inference_with_vllm(
         model_name='rednote-hilab/dots.mocr',
         system_prompt=None,
         api_key=None,
+        strip_reasoning=False,
         ):
 
     addr = f"{protocol}://{ip}:{port}/v1"
@@ -77,8 +113,27 @@ def inference_with_vllm(
         max_completion_tokens=max_completion_tokens,
         temperature=temperature,
         top_p=top_p)
-    content = response.choices[0].message.content
+    choice = response.choices[0]
+    content = choice.message.content
     elapsed = time.monotonic() - start
+    if choice.finish_reason == "length":
+        logger.warning(
+            "vllm response truncated at max_tokens={} (model={}, len={})",
+            max_completion_tokens, model_name, len(content or ""),
+        )
+    # Only the answer is used; reasoning_content (vLLM --reasoning-parser) is
+    # deliberately ignored. Inline thoughts are stripped only when asked: a
+    # document may legitimately contain the literal text "<think>".
+    if strip_reasoning and content:
+        raw = content
+        content = strip_thinking(raw)
+        if len(content) != len(raw):
+            logger.debug("stripped thinking from response: {} chars removed", len(raw) - len(content))
+        if not content:
+            raise ModelOutputError(
+                f"model {model_name} returned reasoning but no answer "
+                f"(finish_reason={choice.finish_reason})"
+            )
     if not content:
         logger.warning("vllm response empty (model={}) in {:.2f}s", model_name, elapsed)
     else:
@@ -87,10 +142,23 @@ def inference_with_vllm(
 
 
 def is_upstream_error(exc: BaseException) -> bool:
-    """True when the failure is the vLLM backend's, not ours.
+    """True when the failure is the vLLM backend's, not the request's.
 
-    Covers connection refused, read timeouts and upstream HTTP errors — anything
-    the OpenAI SDK raises as ``APIError``. The API layer maps these to 502 rather
-    than 500, so a client can tell "the model is down" from "we broke".
+    Connection refused, read timeouts, 5xx and 429. These are retried on the
+    fallback model and mapped to 502, so a client can tell "the model is down"
+    from "we broke". 4xx (prompt too long, bad image, unknown model) is not: the
+    same request would fail anywhere, and it must not trip the breaker.
     """
-    return isinstance(exc, openai.APIError)
+    return isinstance(
+        exc,
+        (openai.APIConnectionError, openai.InternalServerError, openai.RateLimitError),
+    )
+
+
+def is_backend_down(exc: BaseException) -> bool:
+    """True when the backend is unreachable (includes timeouts).
+
+    Only these trip the fallback breaker; a single 5xx may be specific to one
+    request and should not reroute every page.
+    """
+    return isinstance(exc, openai.APIConnectionError)

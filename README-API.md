@@ -75,7 +75,8 @@ All settings are via environment variables. None are required — defaults work 
 | `VLLM_FALLBACK_PROTOCOL` | `VLLM_PROTOCOL` | Fallback `http` or `https` |
 | `VLLM_FALLBACK_MODEL_NAME` | `VLLM_MODEL_NAME` | Model name passed to the fallback server |
 | `VLLM_FALLBACK_API_KEY` | `API_KEY` | API key for the fallback server |
-| `VLLM_FALLBACK_COOLDOWN` | `0` | Seconds to route straight to the fallback after the main model fails; `0` (default) retries the main model on every call |
+| `VLLM_FALLBACK_COOLDOWN` | `0` | Seconds to route straight to the fallback after the main model becomes unreachable; `0` (default) retries the main model on every call |
+| `VLLM_FALLBACK_STRIP_THINKING` | `1` | Strip `<think>…</think>` reasoning from the fallback's answers; set `0` to keep them verbatim |
 | `MOCR_MAX_CONCURRENT` | `2` | Max documents converted concurrently; extra requests queue and wait |
 | `MOCR_API_KEY` | _(unset)_ | When set, enables API key auth on all `/v1` endpoints |
 | `MOCR_OUTPUT_DIR` | `/tmp/mocr_output` | Base directory for temporary output files |
@@ -118,10 +119,18 @@ dots.mocr or a model with the same prompts and output format, because its answer
 are post-processed the same way.
 
 - The fallback is used only when the main call fails with an upstream error
-  (connection refused, timeout, HTTP error). An empty response is **not** retried.
-- With `VLLM_FALLBACK_COOLDOWN` > 0, once the main model fails, calls go straight to the fallback for
+  (connection refused, timeout, 5xx, 429). A 4xx (e.g. prompt or image too long)
+  is the request's fault and is **not** retried, and neither is an empty response.
+- With `VLLM_FALLBACK_COOLDOWN` > 0, once the main model is unreachable (connection
+  refused or timeout — a single 5xx does not count), calls go straight to the fallback for
   `VLLM_FALLBACK_COOLDOWN` seconds, so a stuck backend does not cost a full
-  `VLLM_TIMEOUT` on every page. After that, the main model is tried again.
+  `VLLM_TIMEOUT` on every page. After that, the main model is tried again. If the
+  fallback fails during the cooldown, the main model is probed at once and, if it
+  answers, the cooldown ends early.
+- Thinking models work as a fallback: inline `<think>…</think>` reasoning is stripped
+  from their answers (`VLLM_FALLBACK_STRIP_THINKING`). A reasoning-only answer — e.g.
+  cut off by `max_completion_tokens` mid-thought — fails the page with `page_failed`.
+  The main model's output is never stripped.
 - Pages handled by the fallback are still `success`. Each one is flagged with a
   non-fatal `page_fallback_model` entry in `errors`.
 - If both models fail, the page fails with `page_model_error`, the same as without a fallback.
@@ -395,8 +404,9 @@ document. What happens next depends on `allow_partial_results`:
 | Several sources, any failing | `500` / `502` | `200`, unless nothing at all was recognised |
 
 `502` is returned when *every* fatal error came from the model backend (vLLM
-unreachable, timed out, or answering 5xx) — i.e. the document is probably fine and the
-request is worth retrying. Anything else is `500`.
+unreachable, timed out, or answering 5xx/429) — i.e. the document is probably fine and the
+request is worth retrying. `422` is returned when every failing document could not be
+decoded at all (`document_invalid`). Anything else is `500`.
 
 The error body carries the same per-page structure as a successful response:
 
@@ -425,12 +435,13 @@ The error body carries the same per-page structure as a successful response:
 | Code | Fatal | Meaning |
 |------|-------|---------|
 | `page_failed` | yes | The page raised during processing |
-| `page_model_error` | yes | The vLLM backend failed for this page (connection, timeout, upstream 5xx) |
+| `page_model_error` | yes | The vLLM backend failed for this page (connection, timeout, upstream 5xx/429) |
 | `page_skipped` | yes | The renderer refused the page (oversized embedded image, empty pixmap) |
 | `page_degraded` | no | Content was recovered, but not cleanly — layout JSON did not parse and text was salvaged by the fallback cleaner, or a page artifact could not be read back |
 | `page_empty_response` | no | The model returned an empty response for this page |
 | `page_fallback_model` | no | The main model was unavailable; this page was processed by the fallback model |
-| `document_failed` | yes | The whole document failed (unreadable file, 0 renderable pages) |
+| `document_failed` | yes | The whole document failed (0 renderable pages, internal error) |
+| `document_invalid` | yes | The upload could not be decoded as an image or PDF |
 
 Non-fatal codes are reported in `errors` but never change `status` or the HTTP status —
 they exist so a blank or layout-less page is distinguishable from a genuinely blank one.
@@ -606,14 +617,14 @@ print(results[0]["document"]["md_content"])
 |-------------|-------|
 | `400` | Empty upload (0 bytes) or invalid base64 content |
 | `401` | Missing or invalid `X-API-Key` (when auth is enabled) |
-| `422` | Validation error: unsupported file extension, bad `prompt_mode`, malformed `page_range`, invalid `options_json`/`to_formats`, disallowed `describe_script` |
+| `422` | Validation error: unsupported file extension, bad `prompt_mode`, malformed `page_range`, invalid `options_json`/`to_formats`, disallowed `describe_script`; or the file could not be decoded (`document_invalid`, see **Page Failures**) |
 | `502` | HTTP source download failed, or every page failed because of the model backend (see **Page Failures**) |
 | `404` | Task ID not found (async endpoints) |
 | `202` | Task result requested but not yet complete |
 | `500` | Conversion failed: pages could not be processed and `allow_partial_results` is not set, or an internal error |
 | `200` with `"status":"partial_success"` | Some pages failed and `allow_partial_results` is set |
 
-Failures of a conversion (`500`/`502`) carry a `detail` object with per-document,
+Failures of a conversion (`500`/`502`/`422`) carry a `detail` object with per-document,
 per-page errors — see **Page Failures** for the shape and the code list. The async
 endpoints replay the same status code and body from `GET /v1/result/{task_id}`.
 

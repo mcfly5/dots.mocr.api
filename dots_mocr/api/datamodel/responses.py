@@ -16,13 +16,16 @@ class ExportDocumentResponse(BaseModel):
 
 # Fatal codes make a document fail (or, with allow_partial_results, degrade to
 # "partial_success"); diagnostic ones are reported but never change the status.
-FATAL_ERROR_CODES = {"page_failed", "page_model_error", "page_skipped", "document_failed"}
+FATAL_ERROR_CODES = {
+    "page_failed", "page_model_error", "page_skipped", "document_failed",
+    "document_invalid",
+}
 
 
 class ErrorItem(BaseModel):
     message: str
     # page_failed | page_model_error | page_skipped | page_empty_response |
-    # page_degraded | page_fallback_model | document_failed
+    # page_degraded | page_fallback_model | document_failed | document_invalid
     code: Optional[str] = None
     # 0-indexed PDF page number; None for document-level errors.
     page_no: Optional[int] = None
