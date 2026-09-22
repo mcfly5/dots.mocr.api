@@ -9,7 +9,7 @@ from PIL import Image
 
 from dots_mocr.log import logger
 
-from dots_mocr.model.inference import inference_with_vllm, is_backend_down, is_upstream_error
+from dots_mocr.model.inference import ModelOutputError, inference_with_vllm, is_backend_down, is_upstream_error
 from dots_mocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
 from dots_mocr.utils.image_utils import get_image_by_fitz_doc, fetch_image, smart_resize
 from dots_mocr.utils.doc_utils import fitz_doc_to_image, render_pdf_pages
@@ -369,8 +369,17 @@ class DotsMOCRParser:
                 image,
                 min_pixels=min_pixels, 
                 max_pixels=max_pixels,
+                bbox_scale=self.fallback.get("bbox_scale") if used_fallback else None,
                 )
             if filtered and prompt_mode != 'prompt_layout_only_en':  # model output json failed, use filtered process
+                if response and response.strip() and not (isinstance(cells, str) and cells.strip()):
+                    # The model answered, but none of it survived: a failed page,
+                    # not a degraded one — "success" with empty text would hide it.
+                    model = self.fallback.get("model_name", self.model_name) if used_fallback else self.model_name
+                    raise ModelOutputError(
+                        f"model {model} answered ({len(response)} chars) but it was not "
+                        f"valid layout JSON and no text could be recovered"
+                    )
                 logger.debug(
                     "layout branch=filtered (json parse failed) page_idx={} md_chars={}",
                     page_idx, len(cells) if isinstance(cells, str) else 0,

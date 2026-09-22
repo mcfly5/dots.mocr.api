@@ -1,6 +1,8 @@
+import json
 import time
 
 import pytest
+from PIL import Image
 
 from dots_mocr import parser as parser_mod
 from dots_mocr.parser import DotsMOCRParser
@@ -125,3 +127,33 @@ def test_strip_thinking_can_be_disabled(backend):
     p = _parser(strip_thinking=False)
     _call(p)
     assert backend.calls[-1] == ("fb", False)
+
+
+def _parse_png(p, tmp_path):
+    src = tmp_path / "page.png"
+    Image.new("RGB", (644, 924), "white").save(src)
+    out = tmp_path / "out"
+    out.mkdir()
+    return p.parse_image(str(src), "page", "prompt_layout_all_en", str(out))[0]
+
+
+def test_unrecoverable_answer_fails_page(backend, tmp_path):
+    backend.behaviour["main"] = connection_error()
+    backend.behaviour["fb"] = "I cannot see any document in this image."
+    result = _parse_png(_parser(), tmp_path)
+    assert result["error"]["code"] == "page_failed"
+    assert "fb-model" in result["error"]["message"]
+
+
+def test_qwen_style_fallback_answer_parses_and_scales(backend, tmp_path):
+    backend.behaviour["main"] = connection_error()
+    backend.behaviour["fb"] = (
+        '```json\n[{"bbox_2d": [0, 0, 500, 500], "text_content": "Appendix D"}]\n```'
+    )
+    result = _parse_png(_parser(bbox_scale=1000), tmp_path)
+    assert "error" not in result and not result.get("filtered")
+    assert result["fallback_model"] == "fb-model"
+    with open(result["md_content_path"], encoding="utf-8") as f:
+        assert "Appendix D" in f.read()
+    with open(result["layout_info_path"], encoding="utf-8") as f:
+        assert json.load(f)[0]["bbox"] == [0, 0, 322, 462]

@@ -77,6 +77,7 @@ All settings are via environment variables. None are required — defaults work 
 | `VLLM_FALLBACK_API_KEY` | `API_KEY` | API key for the fallback server |
 | `VLLM_FALLBACK_COOLDOWN` | `0` | Seconds to route straight to the fallback after the main model becomes unreachable; `0` (default) retries the main model on every call |
 | `VLLM_FALLBACK_STRIP_THINKING` | `1` | Strip `<think>…</think>` reasoning from the fallback's answers; set `0` to keep them verbatim |
+| `VLLM_FALLBACK_BBOX_SCALE` | `0` | Coordinate range of the fallback's layout boxes: `0` = pixels of the input image (dots.mocr, Qwen2.5-VL), `1000` = relative 0–1000 (Qwen3-VL / Qwen3.5) |
 | `MOCR_MAX_CONCURRENT` | `2` | Max documents converted concurrently; extra requests queue and wait |
 | `MOCR_API_KEY` | _(unset)_ | When set, enables API key auth on all `/v1` endpoints |
 | `MOCR_OUTPUT_DIR` | `/tmp/mocr_output` | Base directory for temporary output files |
@@ -114,9 +115,13 @@ endpoints (fire-and-forget + polling) over holding a synchronous connection open
 
 ### Fallback model
 
-Set `VLLM_FALLBACK_HOST` to add a second OpenAI-compatible endpoint. It must serve
-dots.mocr or a model with the same prompts and output format, because its answers
-are post-processed the same way.
+Set `VLLM_FALLBACK_HOST` to add a second OpenAI-compatible endpoint. It should serve
+dots.mocr or a model that follows the same prompts, because its answers are
+post-processed the same way. A general Qwen-VL model also works for layout pages:
+a ```` ```json ```` fence around the answer and Qwen grounding keys (`bbox_2d`,
+`text_content`) are accepted, and a missing `category` defaults to `Text`, so such
+pages get text but no headings, tables or formulas. For Qwen3-VL / Qwen3.5, set
+`VLLM_FALLBACK_BBOX_SCALE=1000`, because they emit relative 0–1000 boxes.
 
 - The fallback is used only when the main call fails with an upstream error
   (connection refused, timeout, 5xx, 429). A 4xx (e.g. prompt or image too long)
@@ -434,7 +439,7 @@ The error body carries the same per-page structure as a successful response:
 
 | Code | Fatal | Meaning |
 |------|-------|---------|
-| `page_failed` | yes | The page raised during processing |
+| `page_failed` | yes | The page raised during processing, or the model answered but nothing usable could be recovered from it (not valid layout JSON and no salvageable text) |
 | `page_model_error` | yes | The vLLM backend failed for this page (connection, timeout, upstream 5xx/429) |
 | `page_skipped` | yes | The renderer refused the page (oversized embedded image, empty pixmap) |
 | `page_degraded` | no | Content was recovered, but not cleanly — layout JSON did not parse and text was salvaged by the fallback cleaner, or a page artifact could not be read back |

@@ -204,7 +204,53 @@ def is_legal_bbox(cells):
             return False
     return True
 
-def post_process_output(response, prompt_mode, origin_image, input_image, min_pixels=None, max_pixels=None):
+_CODE_FENCE = re.compile(r"^\s*```[\w-]*[ \t]*\n?(.*?)\n?[ \t]*(?:```\s*)?$", re.DOTALL)
+# Qwen-VL grounding keys, as a generic model (e.g. the fallback) emits them.
+_ALT_KEYS = [
+    (re.compile(r'"bbox_2d"(\s*:)'), r'"bbox"\1'),
+    (re.compile(r'"text_content"(\s*:)'), r'"text"\1'),
+]
+
+
+def normalize_layout_response(text):
+    """Bring a non-dots model's layout answer to the dots.mocr format.
+
+    Strips a markdown code fence around the JSON and renames Qwen-style
+    ``bbox_2d``/``text_content`` keys. Done on the string, so both json.loads
+    and the OutputCleaner salvage path see the dots keys. dots.mocr's own
+    output passes through unchanged.
+    """
+    if not isinstance(text, str):
+        return text
+    m = _CODE_FENCE.match(text)
+    if m:
+        text = m.group(1)
+    for pattern, repl in _ALT_KEYS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def _normalize_cells(cells, input_width, input_height, bbox_scale=None):
+    """Fill in what a non-dots model leaves out: category, and pixel coordinates.
+
+    ``bbox_scale`` is the coordinate range of relative boxes (1000 for
+    Qwen3-VL-style models); falsy means boxes are already in pixels of the
+    model's input image, as with dots.mocr.
+    """
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        cell.setdefault('category', 'Text')
+        if bbox_scale and isinstance(cell.get('bbox'), list) and len(cell['bbox']) == 4:
+            x0, y0, x1, y1 = (float(v) for v in cell['bbox'])
+            cell['bbox'] = [
+                x0 * input_width / bbox_scale, y0 * input_height / bbox_scale,
+                x1 * input_width / bbox_scale, y1 * input_height / bbox_scale,
+            ]
+    return cells
+
+
+def post_process_output(response, prompt_mode, origin_image, input_image, min_pixels=None, max_pixels=None, bbox_scale=None):
     if prompt_mode in ["prompt_ocr", "prompt_table_html", "prompt_table_latex", "prompt_formula_latex"]:
         return response
 
@@ -214,9 +260,11 @@ def post_process_output(response, prompt_mode, origin_image, input_image, min_pi
     )
 
     json_load_failed = False
-    cells = response
+    cells = normalize_layout_response(response)
     try:
         cells = json.loads(cells)
+        if isinstance(cells, list):
+            cells = _normalize_cells(cells, input_image.width, input_image.height, bbox_scale)
         cells = post_process_cells(
             origin_image,
             cells,

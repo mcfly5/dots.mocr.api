@@ -82,6 +82,9 @@ def _fallback_from_env(protocol: str, port: int, model_name: str) -> Optional[di
         "api_key": os.environ.get("VLLM_FALLBACK_API_KEY"),
         # Strip <think> reasoning from the fallback's answers (thinking models).
         "strip_thinking": os.environ.get("VLLM_FALLBACK_STRIP_THINKING", "1") != "0",
+        # Range of the fallback's relative bbox coordinates (1000 for Qwen3-VL
+        # style models); 0 means pixels of the input image, as dots.mocr emits.
+        "bbox_scale": float(os.environ.get("VLLM_FALLBACK_BBOX_SCALE", "0")),
     }
 
 
